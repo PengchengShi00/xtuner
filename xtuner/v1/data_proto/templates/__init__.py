@@ -8,6 +8,12 @@ from .hybrid import HybridChatTemplate
 current_date = datetime.now().strftime("%Y-%m-%d")
 
 CHAT_TEMPLATE_MAP = {
+    "qwen3.5-vl": HybridChatTemplate(
+        image_start_token="<|vision_start|>",
+        image_end_token="<|vision_end|>",
+        image_context_token="<|image_pad|>",
+        video_context_token="<|video_pad|>",
+    ),
     "intern-s1": HybridChatTemplate(
         system="<|im_start|>system\n{system}<|im_end|>\n",
         user="<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n",
@@ -54,7 +60,7 @@ CHAT_TEMPLATE_MAP = {
         """<tool_call></tool_call> XML tags:\n<tool_call>\n{{"name": <function-name>, """
         """"arguments": <args-json-object>}}\n</tool_call>""",  # TODO: fix tool call
         tool_extractor="<|im_start|>user\n<tool_response>\n{tool_extractor}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
-        user="<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",  # only add <think>\n to the end
+        user="<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>",  # only add <think>\n to the end
         stop_words=["<|im_end|>", "<|endoftext|>"],
         assistant="{assistant}<|im_end|>",
         image_start_token="<|vision_start|>",
