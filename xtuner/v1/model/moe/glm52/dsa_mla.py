@@ -19,6 +19,7 @@ from xtuner.v1.ops.sparse_mla import (
     DSATopKIndicesProtocol,
     SparseMLAProtocol,
     ensure_cudnn_dsa_runtime_available,
+    ensure_flash_mla_runtime_available,
     ensure_tilelang_runtime_available,
     get_dsa_topk_indices,
     get_sparse_mla,
@@ -82,7 +83,7 @@ def _validate_indexer_quant_config(
         raise ValueError(f"unsupported Indexer quantization mode: {indexer_quant_mode}")
     if indexer_quant_mode != "ue8m0_fp8":
         return
-    if indexer_backend not in ("tilelang", "cudnn_dsa"):
+    if indexer_backend not in ("tilelang", "cudnn_dsa", "flash_mla"):
         raise ValueError("ue8m0_fp8 Indexer mode requires a CUDA DSA backend")
     if index_head_dim != 128:
         raise ValueError(f"ue8m0_fp8 GLM-5.2 Indexer requires index_head_dim=128, got {index_head_dim}")
@@ -132,8 +133,8 @@ class DSAIndexer(nn.Module):
         index_head_dim: int,
         index_n_heads: int,
         index_topk: int,
-        indexer_backend: Literal["torch", "tilelang", "cudnn_dsa"] = "torch",
         indexer_quant_mode: Literal["none", "ue8m0_fp8"] = "none",
+        indexer_backend: Literal["torch", "tilelang", "cudnn_dsa", "flash_mla"] = "torch",
     ):
         super().__init__()
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -242,7 +243,7 @@ class DSAMLAConfig(MLAConfig):
     index_skip_topk_offset: int = 0
     indexer_rope_interleave: bool = True
     indexer_types: list[str] | None = None
-    sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa"] = "torch"
+    sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa", "flash_mla"] = "torch"
     freeze_dsa_indexer: bool = True
     indexer_quant_mode: Literal["none", "ue8m0_fp8"] = "none"
 
@@ -263,10 +264,12 @@ class DSAMLAConfig(MLAConfig):
             index_head_dim=self.index_head_dim,
             index_n_heads=self.index_n_heads,
         )
-        if self.sparse_mla_backend in ("tilelang", "cudnn_dsa"):
+        if self.sparse_mla_backend in ("tilelang", "cudnn_dsa", "flash_mla"):
             ensure_tilelang_runtime_available()
         if self.sparse_mla_backend == "cudnn_dsa":
             ensure_cudnn_dsa_runtime_available()
+        if self.sparse_mla_backend == "flash_mla":
+            ensure_flash_mla_runtime_available()
 
         return DSAMultiLatentAttention(
             **self.model_dump(),
@@ -290,7 +293,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         index_skip_topk_offset: int = 0,
         indexer_rope_interleave: bool = True,
         indexer_types: list[str] | None = None,
-        sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa"] = "torch",
+        sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa", "flash_mla"] = "torch",
         freeze_dsa_indexer: bool = True,
         indexer_quant_mode: Literal["none", "ue8m0_fp8"] = "none",
         **kwargs,
