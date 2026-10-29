@@ -268,6 +268,11 @@ class TrainEngine:
 
     def from_hf(self, hf_path: str | Path, strict: bool = False):
         self.model.from_hf(hf_path=hf_path, strict=strict)
+        DEVICE_MODULE.empty_cache()
+        logger.info(
+            f"After load hf. Current allocate {DEVICE_MODULE.memory_allocated() / (1024**2)} MB, "
+            f"reserved: {DEVICE_MODULE.memory_reserved() / (1024**2)} MB"
+        )
 
     def init_model_weights(self):
         self.model.init_weights()
@@ -358,6 +363,11 @@ class TrainEngine:
             save_dtype (torch.dtype): The dtype to save the model parameters, bfloat16 or float8.
         """
         self.model.save_hf(hf_dir=hf_dir, save_dtype=save_dtype)
+        DEVICE_MODULE.empty_cache()
+        logger.info(
+            f"After save hf. Current allocate {DEVICE_MODULE.memory_allocated() / (1024**2)} MB, "
+            f"reserved: {DEVICE_MODULE.memory_reserved() / (1024**2)} MB"
+        )
 
     def async_save_hf(
         self,
@@ -407,6 +417,11 @@ class TrainEngine:
                 checkpoint_id=weights_dir,
                 planner=InterleavedShardSavePlanner(),
             )
+        DEVICE_MODULE.empty_cache()
+        logger.info(
+            f"After save dcp. Current allocate {DEVICE_MODULE.memory_allocated() / (1024**2)} MB, "
+            f"reserved: {DEVICE_MODULE.memory_reserved() / (1024**2)} MB"
+        )
 
     def _get_async_checkpoint_pg(self) -> dist.ProcessGroup:
         if self._async_checkpoint_pg is None:
@@ -563,33 +578,36 @@ class TrainEngine:
 
             set_model_state_dict(self.model, state_dict["model"], options=set_options)
 
-            if not load_optimizer:
-                return
+            if load_optimizer:
+                optimizer_state_dict = state_dict["optimizer"]
+                if not load_states:
+                    logger.info("Not loading optimizer states")
+                    optimizer_state_dict["state"] = {}
+                if not load_args:
+                    logger.info("Not loading arg defaults")
+                    param_groups = self.optimizer.state_dict()["param_groups"]
+                    # Now we only support one param_group. If we want to support different lr for different parameters,
+                    # we may use multiple param_groups like:
+                    assert len(param_groups) == 1, "Only one param_group is supported now"
+                    init_defaults = param_groups[0]
+                    init_defaults.pop("params")
+                    for param_group in cast(List[Dict[str, Any]], optimizer_state_dict["param_groups"]):
+                        default_keys = list(filter(lambda x: x != "params", param_group.keys()))
+                        for key in default_keys:
+                            param_group.pop(key)
+                        param_group.update(init_defaults)
 
-            optimizer_state_dict = state_dict["optimizer"]
-            if not load_states:
-                logger.info("Not loading optimizer states")
-                optimizer_state_dict["state"] = {}
-            if not load_args:
-                logger.info("Not loading arg defaults")
-                param_groups = self.optimizer.state_dict()["param_groups"]
-                # Now we only support one param_group. If we want to support different lr for different parameters,
-                # we may use multiple param_groups like:
-                assert len(param_groups) == 1, "Only one param_group is supported now"
-                init_defaults = param_groups[0]
-                init_defaults.pop("params")
-                for param_group in cast(List[Dict[str, Any]], optimizer_state_dict["param_groups"]):
-                    default_keys = list(filter(lambda x: x != "params", param_group.keys()))
-                    for key in default_keys:
-                        param_group.pop(key)
-                    param_group.update(init_defaults)
-
-            set_optimizer_state_dict(
-                self.model,
-                self.optimizer,
-                optim_state_dict=optimizer_state_dict,
-                options=set_options,
-            )
+                set_optimizer_state_dict(
+                    self.model,
+                    self.optimizer,
+                    optim_state_dict=optimizer_state_dict,
+                    options=set_options,
+                )
+        DEVICE_MODULE.empty_cache()
+        logger.info(
+            f"After load dcp. Current allocate {DEVICE_MODULE.memory_allocated() / (1024**2)} MB, "
+            f"reserved: {DEVICE_MODULE.memory_reserved() / (1024**2)} MB"
+        )
 
     def put_model_to_device(self, device: torch.device | str) -> bool:
         """Put the model to the given device."""
