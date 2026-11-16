@@ -56,11 +56,12 @@ flowchart TD
 | `validate_training()` | 只读检查本样本字段、版本长度与摘要一致性 | `validate_train_group` 保留非空、成员状态与组级错误归因，调用 state 验证后由入口决定丢弃 group |
 
 - 保留 `RolloutState` 的 Pydantic BaseModel、现有 token list 表示与普通可变字段；新增 `train_meta: TrainMeta | None` 作为显式序列化字段。`TrainMeta` 是 `@dataclass(frozen=True)`，只含 prompt/response 长度、监督计数、position layout、presence 和 segment 顺序；不放 tokenizer、worker、锁或 PPO values/returns。
+- 推理期从第一轮生成起维护 `input_ids`（训练 prompt 前缀 + 已生成后缀）和 `prompt_length`；引擎输出与工具/环境 token 统一通过 `append_response_tokens` 追加。`response_ids` 不再是独立字段，而是 `input_ids[prompt_length:]` 的只读派生视图；发布后 `prompt_ids`/`tokens` 可清理，但 `input_ids`/`prompt_length` 保留，派生视图继续可用。
 - `num_tokens` 保留为 `RolloutState` 现有的显式字段，是唯一的 shifted training length；TrainMeta 不再复制它，也不增加同名 property。只有 `set_training_fields` 和 `reset_response` 维护其训练生命周期；Controller 在入口验证后只读它。
-- `set_training_fields` 接收完整、未 shift 的 ids/labels/logprobs，先验证并生成摘要，成功后再发布；使用同一私有 `_build_train_meta` 实现摘要规则。普通响应与自定义 agent 的已组装字段都通过这个入口。构造错误仍由 AgentLoop 标记 FAILED、producer 丢弃 group，不能变成整个 produce window 崩溃。
+- `set_training_fields` 接收完整、未 shift 的 ids/labels/logprobs，先验证并生成摘要，成功后再发布；使用同一私有 `_build_train_meta` 实现摘要规则，prompt 边界优先使用已维护的 `prompt_length`。普通响应与自定义 agent 的已组装字段都通过这个入口。构造错误仍由 AgentLoop 标记 FAILED、producer 丢弃 group，不能变成整个 produce window 崩溃。
 - S2 才执行一次 `input[:-1] / labels[1:] / logprobs[1:]`。S1 统计监督 token 时读取 `labels[1:]`，但不保存 shifted 副本；teacher/routing 各自既有坐标转换也只执行一次。
-- `apply_response_mask` 要求 mask 与 `response_ids` 等长，只把不保留的位置改成 ignore，不能恢复原有语义洞。它只用 `replace` 更新 `supervised_tokens`，保持 `num_tokens/prompt_length/layout` 等不变。不能在 mask 后重新从非监督位数推导 prompt 长度；验证也沿用首次发布的 prompt_length。
-- `reset_response` 同时清除 `input_ids/labels/num_tokens/train_meta` 及既有 response 产物，保留 prompt/multimodal 上下文。清字段前沿用原 reset 的 refs 释放规则，不扩展共享 refs 的释放范围，不在 state 方法中选择重试策略或状态。
+- `apply_response_mask` 要求 mask 与 response 后缀等长，只把不保留的位置改成 ignore，不能恢复原有语义洞。它只用 `replace` 更新 `supervised_tokens`，保持 `num_tokens/prompt_length/layout` 等不变。不能在 mask 后重新从非监督位数推导 prompt 长度；验证也沿用首次发布的 prompt_length。
+- `reset_response` 释放 refs 后把 `input_ids` 截断到 `prompt_length`（保留 prompt 前缀），清除 `labels/num_tokens/train_meta` 及既有 response 产物，保留 prompt/multimodal 上下文。清字段前沿用原 reset 的 refs 释放规则，不扩展共享 refs 的释放范围，不在 state 方法中选择重试策略或状态。
 - 所有 canonical 训练字段写入点同步迁移到这些方法，删除 AgentLoop 的 `_write_train_meta` 和 producer 中的 labels offset/计数更新。训练专用摘要不再写入 `extra_fields`；Controller 不回退推导缺失 metadata。保留普通 BaseModel 不代表 Python 会禁止任意字段赋值，调用方仍须遵守统一写入入口，训练入口的只读校验负责发现绕过入口的不一致。
 
 ```mermaid

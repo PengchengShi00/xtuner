@@ -22,7 +22,7 @@ def canonical_state(uid=1):
         group_id=uid,
         message=[{"role": "user", "content": "prompt"}],
         prompt_ids=[10, 11],
-        response_ids=[20, 21, 22, 23],
+        prompt_length=2,
         input_ids=[10, 11, 20, 21, 22, 23],
         labels=[-100, -100, 20, -100, 22, 23],
         response="answer",
@@ -76,14 +76,14 @@ class TestTrainFields(unittest.TestCase):
     def test_eval_and_partial_results_need_no_train_payload(self):
         for status in (Status.COMPLETED, Status.ABORTED, Status.EXPIRED):
             with self.subTest(status=status):
-                state = RolloutState(message=[], status=status, response_ids=[1])
+                state = RolloutState(message=[], status=status)
                 self.admit([state])
                 self.assertIsNone(state.input_ids)
                 self.assertIsNone(state.response_model_steps)
 
     def test_producer_rejects_inactive_result_without_mutating_it(self):
         for status in (Status.INIT, Status.ARCHIVED):
-            state = RolloutState(message=[], status=status, response_ids=[1])
+            state = RolloutState(message=[], status=status)
             with self.assertRaisesRegex(ValueError, "invalid generated status"):
                 self.admit([state])
             self.assertEqual(state.status, status)
@@ -121,7 +121,7 @@ class TestTrainFields(unittest.TestCase):
     def test_public_validation_rejects_versions_longer_than_response(self):
         state = canonical_state()
         state.response_model_steps = [1] * 5
-        with self.assertRaisesRegex(ValueError, "response_model_steps length=5.*response_ids=4"):
+        with self.assertRaisesRegex(ValueError, "response_model_steps length=5.*response suffix=4"):
             self.admit([state])
         self.assertEqual(state.response_model_steps, [1] * 5)
 
@@ -218,7 +218,7 @@ class TestTrainBatchContract(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_batch_retrieval_does_not_require_or_mutate_train_fields(self):
         buffer = SyncReplayBufferConfig().build()
-        state = RolloutState(message=[], status=Status.COMPLETED, response_ids=[1])
+        state = RolloutState(message=[], status=Status.COMPLETED)
         await buffer.put([state], "math", model_step=0)
         runner = _TaskRunner(
             task_name="math",

@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeAlias, cast, overload
 
 import ray
-import torch
 from pydantic import BaseModel, ConfigDict
 from ray.actor import ActorClass, ActorProxy
 from ray.util.placement_group import PlacementGroup
@@ -301,39 +300,44 @@ class AgentLoop(ABC):
                 continue
             try:
                 if state.input_ids is None:
+                    # 纯文本/外部 loop 兜底：只拿到 response 文本时在此 tokenize 并组装。
                     if not state.response:
                         raise ValueError("response must be non-empty")
                     prompt_ids = state.extra_fields.get("train_prompt_ids", state.prompt_ids)
                     assert prompt_ids is not None and len(prompt_ids) > 0, (
                         f"Prompt ids cannot be None or empty in data: {state}"
                     )
-                    response_ids: list[int]
-                    if state.response_ids is not None:
-                        resp_ids_raw = state.response_ids
-                        if isinstance(resp_ids_raw, torch.Tensor):
-                            response_ids = resp_ids_raw.flatten().tolist()
-                        else:
-                            response_ids = cast(list[int], resp_ids_raw)
-                    else:
-                        assert state.response is not None, "response item cannot be None"
-                        response_ids = (
-                            self.tokenizer(state.response, return_tensors="pt")["input_ids"].flatten().tolist()
-                        )
+                    response_ids = self.tokenizer(state.response, return_tensors="pt")["input_ids"].flatten().tolist()
                     if not response_ids:
                         raise ValueError("response_ids must be non-empty")
-                    # 归一化写回：Tensor 展平为 list、tokenizer 兜底结果也落到 response_ids，后续消费者零分支。
-                    state.response_ids = response_ids
-
+                    state.input_ids = list(prompt_ids) + response_ids
+                    state.prompt_length = len(prompt_ids)
+                    state.labels = [-100] * len(prompt_ids) + list(response_ids)
                     if state.logprobs is not None:
                         assert len(state.logprobs) == len(response_ids), (
                             f"{len(state.logprobs)} vs {len(response_ids)}, data: {state}"
                         )
-                        # 只有 response 部分有 logprobs, 前面补 0 对齐全序列
+                        # 推理期只有 response 部分有 logprobs, 前面补 0 对齐全序列
                         state.logprobs = [0.0] * len(prompt_ids) + list(state.logprobs)
-
-                    # 返回的 routed_experts 不包括 eos 的值，实际上也不需要，训练输入会去掉最后一位
-                    state.input_ids = list(prompt_ids) + response_ids
-                    state.labels = [-100] * len(prompt_ids) + list(response_ids)
+                elif state.labels is None:
+                    # input_ids 已由 rollout worker/agent loop 从第一轮起维护，这里只补 labels。
+                    prompt_length = state.effective_prompt_length()
+                    if prompt_length is None:
+                        raise ValueError("input_ids is present but prompt_length cannot be determined")
+                    if len(state.input_ids) <= prompt_length:
+                        raise ValueError("response_ids must be non-empty")
+                    state.labels = [-100] * prompt_length + list(state.input_ids[prompt_length:])
+                    response_length = len(state.input_ids) - prompt_length
+                    if state.logprobs is not None:
+                        if len(state.logprobs) == len(state.input_ids):
+                            pass  # 已经是全序列 logprobs（trace/gsm8k 等）
+                        elif len(state.logprobs) == response_length:
+                            state.logprobs = [0.0] * prompt_length + list(state.logprobs)
+                        else:
+                            raise ValueError(
+                                f"logprobs length {len(state.logprobs)} does not match sequence "
+                                f"{len(state.input_ids)} or response {response_length}"
+                            )
                 # 训练字段与摘要只通过 state 入口发布；已组装的全序列样本也在这里校验并生成 TrainMeta。
                 if state.input_ids is None or state.labels is None:
                     raise ValueError("Training input_ids and labels must be full and aligned")

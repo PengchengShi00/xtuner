@@ -155,13 +155,14 @@ class PartialRolloutHandler:
         rollout_state.finish_reason = finish_reason
         rollout_state.status = status
         history_response = rollout_state.response or ""
-        history_response_ids = list(rollout_state.response_ids or [])
+        history_response_length = rollout_state.response_length
         current_response_ids = list(response_ids or [])
         history_logprobs = list(rollout_state.logprobs or [])
         current_logprobs = list(logprobs or [])
 
+        # input_ids 已从第一轮起维护历史 response；这里只追加本次新增的 token。
+        rollout_state.append_response_tokens(current_response_ids)
         rollout_state.response = history_response + response
-        rollout_state.response_ids = history_response_ids + current_response_ids
         rollout_state.logprobs = history_logprobs + current_logprobs
 
         history_routed_experts = rollout_state.routed_experts
@@ -180,7 +181,7 @@ class PartialRolloutHandler:
                 f"history_routed_experts_len={history_routed_experts_len}, "
                 f"expected_len={history_routed_experts_expect_len}, "
                 f"prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}, "
-                f"history_response_ids_len={len(history_response_ids)}, "
+                f"history_response_length={history_response_length}, "
                 f"current_response_ids_len={len(response_ids)}"
             )
             assert cur_routed_experts_len == routed_experts_expect_len, (
@@ -195,7 +196,7 @@ class PartialRolloutHandler:
                 f"history_routed_experts_len={history_routed_experts_len}, "
                 f"cur_routed_experts_len={cur_routed_experts_len}, "
                 f"prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}, "
-                f"history_response_ids_len={len(history_response_ids)}, "
+                f"history_response_length={history_response_length}, "
                 f"current_response_ids_len={len(response_ids)}"
             )
             cur_routed_experts = cur_routed_experts[history_routed_experts_len:]
@@ -215,9 +216,9 @@ class PartialRolloutHandler:
             )
         elif history_routed_experts is None and routed_experts is not None:
             # case 2: 上一次 rolloutstate 没有 response, 需要历史的 routed_experts， response_ids, logprobs 为空，直接赋值本次的 routed_experts 即可
-            assert not history_response_ids and not history_logprobs, (
+            assert history_response_length == 0 and not history_logprobs, (
                 "Got None historical routed_experts, but historical response_ids or logprobs exist: "
-                f"history_response_ids_len={len(history_response_ids)}, "
+                f"history_response_length={history_response_length}, "
                 f"history_logprobs_len={len(history_logprobs)}, "
             )
             rollout_state.routed_experts = routed_experts

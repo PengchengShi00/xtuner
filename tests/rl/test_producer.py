@@ -53,7 +53,6 @@ def make_rollout_state(
         prompt_ids=[uid],
         tokens=[uid],
         response="" if status in (Status.ABORTED, Status.EXPIRED) else f"response {uid}",
-        response_ids=[],
         finish_reason="abort" if status == Status.ABORTED else "stop",
         reward={"score": reward_score} if reward_score is not None else None,
         seq_staleness=seq_staleness,
@@ -276,8 +275,9 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1],
             tokens=[1, 11],
+            input_ids=[1, 11],
+            prompt_length=1,
             response="old response",
-            response_ids=[11],
             labels=[1],
             response_model_steps=[3],
             logprobs=[0.1],
@@ -337,7 +337,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         agent = self._build_agent_loop()
 
         async def generate(group, **kwargs):
-            group[0].response_ids = [11, 12, 13]
+            group[0].replace_response_tokens([11, 12, 13])
             group[0].response_model_steps = [0, 1, 1]
             return group
 
@@ -347,7 +347,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         )
         ctx.progress.add_produced = MagicMock()
         state = make_rollout_state(1, status=Status.COMPLETED, reward_score=1.0)
-        state.response_ids = [11]
+        state.append_response_tokens([11])
         state.response_model_steps = [0]
         group = await ctx.generate_group([state])
         self.assertTrue(await ctx.put_generated_group(group))
@@ -545,11 +545,11 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
                 if r.group_id == 1:
                     r.status = Status.ABORTED
                     r.response = ""
-                    r.response_ids = []
+                    r.input_ids = None
                 else:
                     r.status = Status.COMPLETED
                     r.response = "ok"
-                    r.response_ids = [1, 2]
+                    r.append_response_tokens([1, 2])
                     r.reward = {"score": 1.0}
             return maybe_filter_invalid_sample(rs, is_valid_sample_fn, mock_agent_loop.logger)
 
@@ -801,14 +801,14 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         task_name = "test_selective_rerollout"
         expired = make_rollout_state(900)
         expired.response = "expired response"
-        expired.response_ids = [11]
+        expired.append_response_tokens([11])
         expired.labels = [1]
         expired.response_model_steps = [0]
         expired.reward = {"score": 0.1}
         fresh = make_rollout_state(901)
         fresh.group_id = expired.group_id
         fresh.response = "fresh response"
-        fresh.response_ids = [21]
+        fresh.append_response_tokens([21])
         fresh.labels = [1]
         fresh.response_model_steps = [5]
         fresh.logprobs = [-0.2]
@@ -832,7 +832,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
                     continue
                 generated_rollout_ids.append(state.rollout_id)
                 state.response = "rerolled response"
-                state.response_ids = [31]
+                state.replace_response_tokens([31])
                 state.logprobs = [-0.1]
                 state.reward = {"score": 0.2}
                 state.finish_reason = "stop"
@@ -920,7 +920,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         async def mock_gen(rs, **kwargs):
             self.assertNotIn("model_step", kwargs)
             for r in rs:
-                r.response_ids = [10, 11]
+                r.append_response_tokens([10, 11])
                 r.status = Status.COMPLETED
             return rs
 
@@ -949,14 +949,14 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         # 验证 partial rollout 保留旧 token 版本，新 token 使用本次调度的 Rollout Model Step。
         task_name = "test_partial_rollout_versions"
         partial_item = make_rollout_state(700, status=Status.ABORTED)
-        partial_item.response_ids = [10]
+        partial_item.append_response_tokens([10])
         partial_item.response_model_steps = [1]
         await self.replay_buffer.put([partial_item], task_name)
 
         async def mock_gen(rs, **kwargs):
             self.assertNotIn("model_step", kwargs)
             # partial rollout 的历史 token 已有版本，新 token 应按本次调度时的模型版本补齐。
-            rs[0].response_ids = [10, 11, 12]
+            rs[0].replace_response_tokens([10, 11, 12])
             rs[0].status = Status.COMPLETED
             return rs
 

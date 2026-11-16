@@ -122,7 +122,7 @@ def _make_state(
         message=[{"role": "user", "content": "prompt"}],
         prompt_ids=resolved_prompt_ids,
         response="response",
-        response_ids=resolved_response_ids,
+        prompt_length=len(resolved_prompt_ids),
         logprobs=logprobs,
         reward={"score": 1.0},
         status=Status.COMPLETED,

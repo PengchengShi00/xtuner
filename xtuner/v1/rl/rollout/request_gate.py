@@ -102,10 +102,11 @@ class RequestGate:
             return self.snapshot()
 
     async def settle_after_backend_sleep(self, epoch: int, request_ids: set[str]):
-        """Finish only identified failed HTTP-timeout leases behind a sealed barrier.
+        """Finish only identified failed HTTP-timeout leases behind a sealed
+        barrier.
 
-        The caller must first certify native backend sleep and record failed
-        trace termination. This method does not turn an unknown failure safe.
+        The caller must first certify native backend sleep and record failed trace termination. This method does not
+        turn an unknown failure safe.
         """
         async with self._condition:
             if self._open or epoch != self._epoch or not request_ids:
@@ -114,7 +115,8 @@ class RequestGate:
                 raise RuntimeError("Unknown or still-running requests prevent recovery")
             for request_id in request_ids:
                 self._active[request_id].settlement = SettlementReceipt(
-                    True, True, "failed_after_confirmed_backend_sleep")
+                    True, True, "failed_after_confirmed_backend_sleep"
+                )
                 del self._active[request_id]
                 del self._failures[request_id]
             self._condition.notify_all()

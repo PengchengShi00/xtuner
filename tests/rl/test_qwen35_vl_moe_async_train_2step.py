@@ -440,10 +440,11 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
                     self.assertIsNotNone(sample.mm_info)
                     self.assertIn("train_prompt_ids", sample.extra_fields)
                     self.assertIn("image_data", sample.extra_fields)
-                    self.assertTrue(sample.response_ids)
+                    # 发布后 response_ids 不再单独存储，长度由 train_meta 推导。
+                    self.assertTrue(sample.response_length)
                     self.assertIsNotNone(sample.logprobs)
                     # canonicalize 后 input_ids/labels/logprobs 全序列对齐（prompt 前缀补 0）。
-                    expected_total_len = len(sample.extra_fields["train_prompt_ids"]) + len(sample.response_ids)
+                    expected_total_len = len(sample.extra_fields["train_prompt_ids"]) + sample.response_length
                     self.assertEqual(len(sample.input_ids), expected_total_len)
                     self.assertEqual(len(sample.logprobs), len(sample.input_ids))
                     self.assertIsNotNone(sample.reward)

@@ -18,7 +18,8 @@ def make_state(**kwargs) -> RolloutState:
         group_id=1,
         message=[{"role": "user", "content": "prompt"}],
         prompt_ids=[10, 11],
-        response_ids=[20, 21, 22],
+        input_ids=[10, 11, 20, 21, 22],
+        prompt_length=2,
         status=Status.COMPLETED,
         **kwargs,
     )
@@ -51,7 +52,7 @@ class TestSetTrainingFields(unittest.TestCase):
         state.validate_training()
 
     def test_invalid_input_leaves_no_partial_update(self):
-        state = make_state()
+        state = RolloutState(rollout_id=1, group_id=1, message=[], status=Status.COMPLETED)
         with self.assertRaises(ValueError):
             state.set_training_fields(input_ids=[10, 11], labels=[-100], logprobs=None)
 
@@ -61,12 +62,11 @@ class TestSetTrainingFields(unittest.TestCase):
         self.assertIsNone(state.train_meta)
 
     def test_prompt_length_falls_back_to_supervision_count(self):
-        # 无显式 prompt_ids 时，prompt 长度由 shift 后的非监督位推导。
+        # 无显式 prompt_ids/prompt_length 时，prompt 长度由 shift 后的非监督位推导。
         state = RolloutState(
             rollout_id=1,
             group_id=1,
             message=[],
-            response_ids=[20, 21],
             status=Status.COMPLETED,
         )
         state.response_model_steps = [1, 1]
@@ -74,6 +74,35 @@ class TestSetTrainingFields(unittest.TestCase):
 
         self.assertEqual(state.train_meta.prompt_length, 0)
         self.assertEqual(state.train_meta.supervised_tokens, 2)
+
+    def test_explicit_prompt_length_is_authoritative(self):
+        # 推理期维护的 prompt_length 是唯一权威边界，不再由 response 后缀反推。
+        state = RolloutState(
+            rollout_id=1,
+            group_id=1,
+            message=[],
+            input_ids=[10, 20, 21],
+            prompt_length=1,
+            status=Status.COMPLETED,
+        )
+        state.response_model_steps = [1, 1]
+        state.set_training_fields(input_ids=state.input_ids, labels=[-100, 20, 21], logprobs=None)
+
+        self.assertEqual(state.train_meta.prompt_length, 1)
+        self.assertEqual(state.train_meta.response_length, 2)
+        state.validate_training()
+
+    def test_republish_preserves_published_prompt_boundary(self):
+        # 重复发布（重试组中保留的 COMPLETED 成员会再次 canonicalize）必须沿用首次
+        # 发布的 prompt 边界：此时 prompt_ids/tokens 已被清除，不能重新推导。
+        state = make_state()
+        state.set_training_fields(input_ids=[10, 11, 20, 21, 22], labels=[-100, -100, 20, 21, 22], logprobs=None)
+        published = state.train_meta
+
+        state.set_training_fields(input_ids=state.input_ids, labels=state.labels, logprobs=state.logprobs)
+
+        self.assertEqual(state.train_meta, published)
+        state.validate_training()
 
     def test_validate_detects_stale_meta(self):
         state = make_state()
@@ -99,7 +128,8 @@ class TestApplyResponseMask(unittest.TestCase):
             group_id=1,
             message=[],
             prompt_ids=prompt_ids,
-            response_ids=[20, 21, 22],
+            input_ids=[10, 11, 20, 21, 22],
+            prompt_length=2,
             status=Status.COMPLETED,
         )
         state.response_model_steps = [1, 1, 1]
@@ -152,7 +182,7 @@ class TestApplyResponseMask(unittest.TestCase):
 
     def test_wrong_mask_length_raises(self):
         state = self._published()
-        with self.assertRaisesRegex(ValueError, "align with response_ids"):
+        with self.assertRaisesRegex(ValueError, "align with the response suffix"):
             state.apply_response_mask([True])
 
 
@@ -164,7 +194,8 @@ class TestResetResponse(unittest.TestCase):
 
         state.reset_response()
 
-        self.assertIsNone(state.input_ids)
+        # 保留 prompt 前缀；response 后缀与派生的训练字段一起失效。
+        self.assertEqual(state.input_ids, [10, 11])
         self.assertIsNone(state.labels)
         self.assertIsNone(state.num_tokens)
         self.assertIsNone(state.train_meta)
@@ -177,7 +208,7 @@ class TestResetResponse(unittest.TestCase):
         state = make_state()
         state.set_training_fields(input_ids=[10, 11, 20, 21, 22], labels=[-100, -100, 20, 21, 22], logprobs=None)
         state.reset_response()
-        state.response_ids = [30, 31]
+        state.append_response_tokens([30, 31])
         state.response_model_steps = [2, 2]
         state.set_training_fields(input_ids=[10, 11, 30, 31], labels=[-100, -100, 30, 31], logprobs=None)
 

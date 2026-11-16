@@ -262,7 +262,7 @@ class TestRLColocateTrainerIntegration(unittest.TestCase):
                     message=[{"role": "user", "content": prompt}],
                     prompt_ids=prompt_ids,
                     response=response,
-                    response_ids=response_ids,
+                    prompt_length=len(prompt_ids),
                     reward={"score": group_rewards[i]},
                     status=Status.COMPLETED,
                     input_ids=prompt_ids + response_ids,

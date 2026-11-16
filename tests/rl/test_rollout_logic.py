@@ -1009,8 +1009,7 @@ class TestRolloutWorker(unittest.IsolatedAsyncioTestCase):
         rollout_state = RolloutState(
             rollout_id=1,
             message=[],
-            prompt_ids=[10, 11],
-            response_ids=[101, 999],
+            prompt_ids=[10, 11], input_ids=[10, 11, 101, 999], prompt_length=2,
             sample_params=SampleParams(max_tokens=8, return_token_ids=True),
             status=Status.ABORTED,
         )
@@ -1030,8 +1029,7 @@ class TestRolloutWorker(unittest.IsolatedAsyncioTestCase):
         rollout_state = RolloutState(
             rollout_id=2,
             message=[],
-            prompt_ids=[10, 11],
-            response_ids=[201, 202, 203],
+            prompt_ids=[10, 11], input_ids=[10, 11, 201, 202, 203], prompt_length=2,
             sample_params=SampleParams(max_tokens=3, return_token_ids=True),
             status=Status.ABORTED,
         )
@@ -1666,9 +1664,8 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
         rollout_state = RolloutState(
             rollout_id=1,
             message=[],
-            prompt_ids=[10, 11],
+            prompt_ids=[10, 11], input_ids=[10, 11, 101, 102], prompt_length=2,
             response="old",
-            response_ids=[101, 102],
             logprobs=[0.1, 0.2],
             sample_params=SampleParams(max_tokens=5, return_token_ids=True),
             status=Status.ABORTED,
@@ -1704,9 +1701,8 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
         rollout_state = RolloutState(
             rollout_id=2,
             message=[],
-            prompt_ids=[10],
+            prompt_ids=[10], input_ids=[10, 101, 102], prompt_length=1,
             response="a",
-            response_ids=[101, 102],
             logprobs=[0.1, 0.2],
             sample_params=SampleParams(max_tokens=max_tokens, return_token_ids=True),
             status=Status.ABORTED,
@@ -1761,8 +1757,10 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
         concat_ref = FakeObjectRef(None)
         rollout_state = RolloutState(
             message=[],
+            prompt_ids=[1],
+            input_ids=[1, 1, 2],
+            prompt_length=1,
             response="old",
-            response_ids=[1, 2],
             logprobs=[0.1, 0.2],
             routed_experts=history_ref,
             status=Status.ABORTED,

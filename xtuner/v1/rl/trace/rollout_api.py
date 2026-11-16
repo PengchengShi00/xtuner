@@ -139,8 +139,13 @@ def rollout_state_initial_attributes(rollout_state: RolloutState) -> dict[str, A
         "xtuner.task_name": rollout_state.task_name or extra_fields.get("task_name"),
         "xtuner.producer_future_step": extra_fields.get("producer_future_step"),
     }
-    if rollout_state.prompt_ids is not None:
-        attributes["prompt.tokens"] = len(rollout_state.prompt_ids)
+    prompt_length = (
+        rollout_state.train_meta.prompt_length
+        if rollout_state.train_meta is not None
+        else (len(rollout_state.prompt_ids) if rollout_state.prompt_ids is not None else None)
+    )
+    if prompt_length is not None:
+        attributes["prompt.tokens"] = prompt_length
     return {key: value for key, value in attributes.items() if value is not None}
 
 
@@ -152,7 +157,9 @@ def rollout_state_final_attributes(rollout_state: RolloutState) -> dict[str, Any
             "error.message": rollout_state.error_msg,
         }
     )
-    if rollout_state.response_ids is not None:
+    if rollout_state.train_meta is not None:
+        attributes["completion.tokens"] = rollout_state.train_meta.response_length
+    elif rollout_state.response_ids is not None:
         attributes["completion.tokens"] = len(rollout_state.response_ids)
     reward = rollout_state.reward
     if isinstance(reward, Mapping):

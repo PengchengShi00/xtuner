@@ -199,7 +199,7 @@ class TestTrajectoryLogging(unittest.TestCase):
             message=[{"role": "user", "content": "test"}],
             num_tokens=1,
             response=f"response-{segment_index}",
-            response_ids=[10, 11],
+            input_ids=[10, 11], prompt_length=0,
             reward={"score": reward},
             status=status,
             extra_fields=extra_fields,
@@ -285,6 +285,7 @@ class TestTrajectoryLogging(unittest.TestCase):
             segment_count=2,
         )
         state.prompt_ids = [98, 99, 100]
+        state.prompt_length = 3
         state.response_model_steps = [1, 1]
         state.set_training_fields(
             input_ids=[98, 99, 100, 10, 11],
@@ -330,7 +331,7 @@ class TestTrajectoryLogging(unittest.TestCase):
             message=[{"role": "user", "content": "test"}],
             num_tokens=1,
             response="response",
-            response_ids=[10, 11],
+            input_ids=[10, 11], prompt_length=0,
             reward={"score": 1.0},
             status=Status.COMPLETED,
             extra_fields={},

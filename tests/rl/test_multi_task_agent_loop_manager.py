@@ -326,7 +326,7 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[3, 4],
+            prompt_length=2,
             input_ids=[1, 2, 3, 4],
             labels=[-100, -100, 3, 4],
             response_model_steps=[0, 4],
@@ -364,14 +364,15 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
         trained_state.validate_training()
         self.assertEqual(replay_buffer.task_token_stale_threshold_calls, [{"task": 4}])
 
-    async def test_take_train_batch_skips_states_without_response_ids(self):
-        # response_ids 缺失的样本没有可对齐的 response 段，不参与 token staleness 烙制。
+    async def test_take_train_batch_skips_states_without_response_suffix(self):
+        # response 后缀长度为 0 的样本没有可对齐的 response 段，不参与 token staleness 烙制。
         state = RolloutState(
             rollout_id=1,
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
+            prompt_ids=[1, 2],
             input_ids=[1, 2],
-            labels=[-100, 2],
+            labels=[-100, -100],
             logprobs=[0.0, -0.1],
             status=Status.COMPLETED,
         )
@@ -396,11 +397,11 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await manager.produce_batch(batch_size=1, train_step=5, model_step=4)
-        self.assertEqual(result.rollout_states[0][0].labels, [-100, 2])
+        self.assertEqual(result.rollout_states[0][0].labels, [-100, -100])
         trainer = SimpleNamespace(logger=MagicMock(), agent_loop_manager=manager)
         await asyncio.to_thread(BaseRLTrainer._prepare_train_batch, trainer, result.rollout_states, 5, result)
 
-        self.assertEqual(result.rollout_states[0][0].labels, [-100, 2])
+        self.assertEqual(result.rollout_states[0][0].labels, [-100, -100])
 
     async def test_take_train_batch_bakes_full_sequence_agentic_per_token_staleness(self):
         # agentic 全序列形态（response_ids 为 input_ids 去掉 prompt 前缀的后缀，含环境 token）
@@ -411,7 +412,7 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[30, -1, 40],
+            prompt_length=2,
             response_model_steps=[0, 4, 4],
             input_ids=[1, 2, 30, -1, 40],
             labels=[-100, -100, 30, -100, 40],
@@ -454,7 +455,7 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[3, 4, 5],
+            prompt_length=2,
             input_ids=[1, 2, 3, 4, 5],
             labels=[-100, -100, 4, 5, -100],
             status=Status.COMPLETED,

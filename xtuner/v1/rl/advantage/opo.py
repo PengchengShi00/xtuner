@@ -31,7 +31,7 @@ class OPOEstimator(AdvantageEstimator):
 
     def compute(self, rewards: torch.Tensor, group: list[Any]) -> torch.Tensor:
         lengths = torch.tensor(
-            [_response_len(data) for data in group],
+            [data.response_length for data in group],
             dtype=torch.float32,
             device=rewards.device,
         )
@@ -40,9 +40,3 @@ class OPOEstimator(AdvantageEstimator):
 
     def __repr__(self) -> str:
         return "OPOEstimator()"
-
-
-def _response_len(data: Any) -> int:
-    if hasattr(data, "response_ids"):
-        return len(data.response_ids or [])
-    return len(data.env.rollout.response_ids or [])

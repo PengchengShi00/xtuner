@@ -299,7 +299,7 @@ class TestVerlToolAgentLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state.status, Status.COMPLETED)
             self.assertIsNotNone(state.response_ids)
             self.assertGreater(len(state.response_ids), 0)
-            self.assertIsNotNone(state.prompt_ids)
+            self.assertIsNotNone(state.prompt_length)
             self.assertIsNotNone(state.logprobs)
             self.assertIsNotNone(state.loss_mask)
 
@@ -397,7 +397,7 @@ class TestVerlToolAgentLoop(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(state.response_ids)
                 self.assertGreater(len(state.response_ids), 0)
                 self.assertEqual(state.message, group_message)
-                self.assertIsNotNone(state.prompt_ids)
+                self.assertIsNotNone(state.prompt_length)
                 self.assertIsNotNone(state.logprobs)
                 self.assertIsNotNone(state.loss_mask)
 

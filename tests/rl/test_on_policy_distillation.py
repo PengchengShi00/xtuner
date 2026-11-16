@@ -407,7 +407,7 @@ class TestRolloutTeacherClient(unittest.IsolatedAsyncioTestCase):
             group_id=1,
             message=[],
             prompt_ids=[10, 11, 12],
-            response_ids=[13, 14],
+            input_ids=[10, 11, 12, 13, 14], prompt_length=3,
             status=Status.COMPLETED,
             extra_fields={"origin_data_source": "math"},
         )
@@ -443,7 +443,7 @@ class TestRolloutTeacherClient(unittest.IsolatedAsyncioTestCase):
             group_id=1,
             message=[],
             prompt_ids=[10, 11, 12],
-            response_ids=[13, 14],
+            input_ids=[10, 11, 12, 13, 14], prompt_length=3,
             status=Status.COMPLETED,
             extra_fields={"origin_data_source": "math"},
         )

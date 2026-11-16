@@ -100,21 +100,19 @@ class TokenizedSegment(BaseModel):
 
     request_id: str | None = None
     model_step: int | None = None
-    text: str
     token_ids: List[int]
+    # labels/logprobs 缺省表示整段非生成位（prompt/工具 delta），导出时按
+    # [-100] * len / [0.0] * len 物化，避免在 store 中长期保存占位列表。
+    # 段文本即 Trie 边标签，不再重复存储。
     labels: List[int] | None = Field(default=None, repr=False)
     logprobs: List[float] | None = Field(default=None, repr=False)
     expert_key: Any = Field(default=None, repr=False)
-    length: int | None = None
 
     def model_post_init(self, _):
-        if self.labels is None:
-            self.labels = [-100] * len(self.token_ids)
-        if self.logprobs is None:
-            self.logprobs = [0.0] * len(self.token_ids)
-        if self.length is None:
-            self.length = len(self.token_ids)
-        assert len(self.token_ids) == len(self.labels) == len(self.logprobs)
+        if self.labels is not None:
+            assert len(self.token_ids) == len(self.labels)
+        if self.logprobs is not None:
+            assert len(self.token_ids) == len(self.logprobs)
 
 
 @dataclass
@@ -218,7 +216,8 @@ class Trie:
         return "".join(key_path), matched_nodes
 
     def release(self, key: str | None = None):
-        """Drop trace ownership; exported and sibling route references remain valid.
+        """Drop trace ownership; exported and sibling route references remain
+        valid.
 
         If the key is None, the entire Trie is released. Prunes empty branches bottom-up.
 
@@ -411,20 +410,20 @@ class RolloutTraceStore:
             )
         trace: dict[str, Any] = {"input_ids": [], "labels": [], "logprobs": []}
         expert_keys: list[Any] = []
-        response_model_steps = []
-        token_model_steps = []
-        request_ids = []
+        response_model_steps: list[int | None] = []
+        token_model_steps: list[int | None] = []
+        request_ids: list[str] = []
         for node in nodes:
             node_val = node.value
             if not isinstance(node_val, TokenizedSegment):
                 raise TypeError(f"Unexpected trace node value type: {type(node_val)!r}")
-            assert node_val.labels is not None
-            assert node_val.logprobs is not None
+            node_labels = node_val.labels if node_val.labels is not None else [-100] * len(node_val.token_ids)
+            node_logprobs = node_val.logprobs if node_val.logprobs is not None else [0.0] * len(node_val.token_ids)
             trace["input_ids"].extend(node_val.token_ids)
-            trace["labels"].extend(node_val.labels)
-            trace["logprobs"].extend(node_val.logprobs)
+            trace["labels"].extend(node_labels)
+            trace["logprobs"].extend(node_logprobs)
             expert_keys.append(node_val.expert_key)
-            response_model_steps.extend(node_val.model_step for label in node_val.labels if label != -100)
+            response_model_steps.extend(node_val.model_step for label in node_labels if label != -100)
             token_model_steps.extend([node_val.model_step] * len(node_val.token_ids))
             if node_val.request_id is not None and node_val.request_id not in request_ids:
                 request_ids.append(node_val.request_id)
@@ -434,19 +433,22 @@ class RolloutTraceStore:
         # Tool-result deltas remain in the contiguous response suffix.
         if nodes:
             head = nodes[0].value
-            if any(label != -100 for label in head.labels):
+            if not isinstance(head, TokenizedSegment):
+                raise TypeError(f"Unexpected trace head value type: {type(head)!r}")
+            if head.labels is not None and any(label != -100 for label in head.labels):
                 raise ValueError(f"Trace head of session {session_id!r} is not a prompt segment")
             trace["prompt_ids"] = list(head.token_ids)
         else:
             trace["prompt_ids"] = []
-        trace["response_ids"] = list(trace["input_ids"][len(trace["prompt_ids"]):])
+        trace["response_ids"] = list(trace["input_ids"][len(trace["prompt_ids"]) :])
         if request_ids:
             trace["response_model_steps"] = response_model_steps
             trace["request_ids"] = request_ids
         return trace
 
     def contains_request_ids(self, session_id: str, request_ids: list[str]) -> bool:
-        """Validate transcript provenance across committed branches of one session."""
+        """Validate transcript provenance across committed branches of one
+        session."""
         trie = self.sessions.get(session_id)
         if trie is None:
             return False
@@ -454,7 +456,9 @@ class RolloutTraceStore:
         stack = [trie.root]
         while stack and missing:
             node = stack.pop()
-            missing.discard(getattr(node.value, "request_id", None))
+            request_id = getattr(node.value, "request_id", None)
+            if isinstance(request_id, str):
+                missing.discard(request_id)
             stack.extend(node.children.values())
         return not missing
 

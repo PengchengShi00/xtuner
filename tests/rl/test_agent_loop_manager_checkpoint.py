@@ -88,7 +88,9 @@ class _FakeRolloutController:
     def _generate(self, rollout_state: RolloutState) -> RolloutState:
         rollout_state.status = Status.COMPLETED
         rollout_state.response = "ok"
-        rollout_state.response_ids = [100, 101]
+        if rollout_state.input_ids is None and not (rollout_state.prompt_ids or rollout_state.tokens):
+            rollout_state.prompt_ids = [1]
+        rollout_state.append_response_tokens([100, 101])
         rollout_state.reward = {"score": 1.0 if int(rollout_state.rollout_id or 0) % 2 == 0 else 0.5}
         return rollout_state
 
@@ -311,7 +313,7 @@ class TestAgentLoopManagerCheckpoint(unittest.IsolatedAsyncioTestCase):
                 message=[{"role": "user", "content": "buffered"}],
                 prompt_ids=[1, 2, 3],
                 response="ok",
-                response_ids=[100 + idx],
+                input_ids=[1, 2, 3, 100 + idx], prompt_length=3,
                 reward={"score": 1.0},
                 status=Status.COMPLETED,
                 extra_fields={"index": 90},

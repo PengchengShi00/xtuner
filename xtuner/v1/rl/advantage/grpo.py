@@ -58,7 +58,7 @@ class DrGRPOEstimator(AdvantageEstimator):
         z = (rewards - mean) / std
 
         lengths = torch.tensor(
-            [_response_len(data) for data in group],
+            [data.response_length for data in group],
             dtype=torch.float32,
             device=rewards.device,
         )
@@ -66,9 +66,3 @@ class DrGRPOEstimator(AdvantageEstimator):
 
     def __repr__(self) -> str:
         return f"DrGRPOEstimator(max_length={self.max_length}, eps={self.eps})"
-
-
-def _response_len(data: Any) -> int:
-    if hasattr(data, "response_ids"):
-        return len(data.response_ids or [])
-    return len(data.env.rollout.response_ids or [])

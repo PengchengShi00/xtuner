@@ -140,7 +140,7 @@ class BaseProduceContext:
         for item in rollout_state:
             item.extra_fields["producer_future_step"] = self.train_step
 
-        inherited_tokens = sum(len(item.response_ids or []) for item in rollout_state)
+        inherited_tokens = sum(item.response_length for item in rollout_state)
         start = time.perf_counter()
         if isinstance(self.agent_loop, ray.actor.ActorHandle):
             result = await self.agent_loop.generate_group.remote(
@@ -153,7 +153,7 @@ class BaseProduceContext:
                 enable_partial_rollout=enable_partial_rollout,
             )
         elapsed = time.perf_counter() - start
-        new_tokens = max(0, sum(len(item.response_ids or []) for item in result) - inherited_tokens)
+        new_tokens = max(0, sum(item.response_length for item in result) - inherited_tokens)
         for index, item in enumerate(result):
             extra_fields = getattr(item, "extra_fields", None)
             if extra_fields is None:
@@ -168,7 +168,7 @@ class BaseProduceContext:
     async def put_generated_group(self, group: list[RolloutState]) -> bool:
         produced_tokens = sum(
             item.extra_fields.get(
-                "new_response_tokens", max(0, len(item.response_ids or []) - len(item.response_model_steps or []))
+                "new_response_tokens", max(0, item.response_length - len(item.response_model_steps or []))
             )
             for item in group
         )
@@ -754,7 +754,8 @@ class _PendingTasks:
             return claimed
 
     async def cancel_detached(self) -> tuple[set[asyncio.Task], list[list[RolloutState]]]:
-        """Transfer unselected tasks and their trace owners after certified pause."""
+        """Transfer unselected tasks and their trace owners after certified
+        pause."""
         async with self._lock:
             tasks = set(self._tasks)
             self._tasks.clear()
@@ -825,7 +826,8 @@ async def request_agent_loop_pause(ctx: BaseProduceContext, *, pending_count: in
 
 
 async def retain_pending_tasks(*, pending_tasks, ctx, put_claimed_task) -> float:
-    """Claim completed groups once; live Agent tasks keep their original owner."""
+    """Claim completed groups once; live Agent tasks keep their original
+    owner."""
     start = time.perf_counter()
     for task in await pending_tasks.claim_ready():
         await put_claimed_task(task)

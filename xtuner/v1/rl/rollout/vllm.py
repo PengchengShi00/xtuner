@@ -525,8 +525,17 @@ class vLLMWorker(RolloutWorker):
                 rollout_state.error_msg = error_msg
                 return rollout_state
 
+        if last_token_ids:
+            if self.enable_partial_rollout:
+                # TODO: vLLM 尚未接入 PartialRolloutHandler；这里保持历史行为（只保留本次输出），
+                # 后续应统一走 postprocess 以拼接历史 response/logprobs。
+                rollout_state.replace_response_tokens(last_token_ids)
+                # 被替换的 suffix 版本信息一并作废，避免 response_model_steps 与 suffix 长度错位。
+                rollout_state.response_model_steps = None
+            else:
+                # 从第一轮起维护训练序列：本次引擎输出追加到 input_ids 的 response 后缀。
+                rollout_state.append_response_tokens(last_token_ids)
         rollout_state.response = last_trajectory
-        rollout_state.response_ids = last_token_ids if len(last_token_ids) > 0 else None
         rollout_state.logprobs = last_logprobs if len(last_logprobs) > 0 else None
         rollout_state.routed_experts = routed_experts
         rollout_state.finish_reason = finish_reason

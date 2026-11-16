@@ -5,7 +5,7 @@ from typing import cast
 
 from pydantic import BaseModel, ConfigDict
 
-from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams
+from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
 from xtuner.v1.rl.agent_loop import AgentLoop, AgentLoopConfig
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
@@ -67,8 +67,8 @@ class GSM8KToolAgentLoop(AgentLoop):
             actual_answer = "#### " + actual_answer
         return compute_reward(actual_answer, ground_truth, extra_info)
 
-    def extract_tool_calls(self, rollout_state: RolloutState) -> tuple[str, list[FunctionCall]]:
-        text = self.tokenizer.decode(rollout_state.response_ids)
+    def extract_tool_calls(self, token_ids: list[int]) -> tuple[str, list[FunctionCall]]:
+        text = self.tokenizer.decode(token_ids)
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
 
@@ -87,40 +87,59 @@ class GSM8KToolAgentLoop(AgentLoop):
         return content, function_calls
 
     async def generate_sample(self, rollout_state: RolloutState, **kwargs) -> RolloutState:
-        # Respect state passed from preprocess for partial rollout continuation.
-        base_sample_params = copy.deepcopy(rollout_state.sample_params or self.sample_params)
-        final_response_mask: list[int] = []
-        final_response_ids: list[int] = []
-        final_logprobs: list[float] = []
+        # 已发布样本（重试组中保留的 COMPLETED 成员）直接复用，避免重复生成与重复追加。
+        if rollout_state.train_meta is not None:
+            return rollout_state
+        if rollout_state.response_length > 0:
+            # 不复用上一轮的 partial response：gsm8k 的工具 token 语义 mask 不随 state 持久化，
+            # 续写无法重建 labels。旧实现由 worker 在 partial rollout 关闭时 reset；这里统一 reset。
+            rollout_state.reset_response()
 
+        base_sample_params = copy.deepcopy(rollout_state.sample_params or self.sample_params)
         max_len = base_sample_params.max_tokens
-        cur_turn_tokens = list(rollout_state.tokens or rollout_state.prompt_ids or [])
-        remaining_max_tokens = max_len - len(final_response_ids)
+        prompt_ids = list(rollout_state.prompt_ids or [])
+        prompt_length = rollout_state.effective_prompt_length()
+        if prompt_length is None:
+            prompt_length = len(prompt_ids)
+        if not prompt_ids and rollout_state.input_ids is not None:
+            prompt_ids = list(rollout_state.input_ids[:prompt_length])
+        assert prompt_ids and prompt_length > 0, f"Prompt ids cannot be None or empty in data: {rollout_state}"
+
+        final_response_mask: list[int] = []
+        final_logprobs: list[float] = []
+        logprobs_available = True
         cur_turn = 0
         while True:
-            if cur_turn >= self.max_turns or len(final_response_ids) >= max_len or remaining_max_tokens <= 0:
+            response_length = rollout_state.response_length
+            if cur_turn >= self.max_turns or response_length >= max_len:
                 break
 
-            rollout_state.tokens = cur_turn_tokens
+            # 每轮都是一次新的生成；重置 status 以免命中 worker 的 COMPLETED 早退。
+            rollout_state.status = Status.INIT
+            rollout_state.tokens = prompt_ids + list(rollout_state.response_ids or [])
             rollout_state.sample_params = copy.deepcopy(base_sample_params)
-            rollout_state.sample_params.max_tokens = remaining_max_tokens
+            rollout_state.sample_params.max_tokens = max_len - response_length
 
+            before = rollout_state.response_length
             assert self.rollout_ctl is not None
             rollout_state = await self.rollout_ctl.generate.remote(rollout_state)  # type: ignore[attr-defined]
             cur_turn += 1
-            response_ids = cast(list[int], rollout_state.response_ids)
-            cur_turn_tokens.extend(response_ids)
+            if rollout_state.status != Status.COMPLETED:
+                return rollout_state
 
-            # 处理 rollout_controller 的输出
-            final_response_ids.extend(response_ids)
-            final_logprobs.extend(cast(list[float], rollout_state.logprobs))
-            final_response_mask.extend([1] * len(response_ids))
+            generated_length = rollout_state.response_length - before
+            final_response_mask.extend([1] * generated_length)
+            if rollout_state.logprobs is None:
+                logprobs_available = False
+            elif generated_length:
+                final_logprobs.extend(list(rollout_state.logprobs)[-generated_length:])
             # TODO: 处理 routed_experts, 要注意这里涉及到是否要解引用的问题
 
-            if len(final_response_ids) >= max_len:
+            if rollout_state.response_length >= max_len:
                 break
 
-            _, function_calls = self.extract_tool_calls(rollout_state)
+            current_turn_ids = list(rollout_state.response_ids or [])[-generated_length:] if generated_length else []
+            _, function_calls = self.extract_tool_calls(current_turn_ids)
             if not function_calls:
                 break
 
@@ -138,31 +157,31 @@ class GSM8KToolAgentLoop(AgentLoop):
                     }
                     tool_messages.append(tool_message)
 
-            # 处理工具调用的输出
+            # 工具 token 追加进同一条训练序列；mask=0 表示不参与训练。
             tools_response_ids = self.tokenizer.apply_chat_template(tool_messages, remove_system_prompt=True)
-            final_response_ids.extend(tools_response_ids)
+            rollout_state.append_response_tokens(tools_response_ids)
             final_logprobs.extend([0.0] * len(tools_response_ids))
             final_response_mask.extend([0] * len(tools_response_ids))
 
-            # 处理下一轮生成的输入
-            cur_turn_tokens.extend(tools_response_ids)
-            remaining_max_tokens = max_len - len(final_response_ids)
-
-        final_response_ids = final_response_ids[:max_len]
-        final_response_mask = final_response_mask[:max_len]
-        final_logprobs = final_logprobs[:max_len]
-
-        prompt_ids = rollout_state.prompt_ids
-        assert prompt_ids is not None and len(prompt_ids) > 0, (
-            f"Prompt ids cannot be None or empty in data: {rollout_state}"
-        )
-        rollout_state.response_ids = final_response_ids
-        rollout_state.logprobs = [0.0] * len(prompt_ids) + final_logprobs
-        rollout_state.input_ids = list(prompt_ids) + final_response_ids
-        rollout_state.labels = [-100] * len(prompt_ids) + [
-            resp_id if mask_value else -100 for resp_id, mask_value in zip(final_response_ids, final_response_mask)
+        # 截断到 max_len，并按最终 suffix + mask 重建 labels/logprobs/response。
+        if rollout_state.input_ids is not None:
+            del rollout_state.input_ids[prompt_length + max_len :]
+        response_ids = list(rollout_state.response_ids or [])
+        response_mask = final_response_mask[: len(response_ids)]
+        if len(response_mask) < len(response_ids):
+            raise ValueError(
+                f"response mask length={len(response_mask)} does not cover response suffix={len(response_ids)}"
+            )
+        rollout_state.labels = [-100] * prompt_length + [
+            resp_id if mask_value else -100 for resp_id, mask_value in zip(response_ids, response_mask)
         ]
-        rollout_state.response = self.tokenizer.decode(rollout_state.response_ids)
+        if logprobs_available:
+            final_logprobs = final_logprobs[: len(response_ids)]
+            final_logprobs.extend([0.0] * (len(response_ids) - len(final_logprobs)))
+            rollout_state.logprobs = [0.0] * prompt_length + final_logprobs
+        else:
+            rollout_state.logprobs = None
+        rollout_state.response = self.tokenizer.decode(response_ids)
         if self.judger is not None and not self.enable_batch_judge:
             rollout_state = await self.run_judger(rollout_state)
         return rollout_state

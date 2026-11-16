@@ -1326,8 +1326,9 @@ class RolloutWorker(SingleAcceleratorWorker):
                         completion_tokens=completion_tokens,
                     )
                 else:
+                    # 从第一轮起维护训练序列：本次引擎输出追加到 input_ids 的 response 后缀。
+                    rollout_state.append_response_tokens(response_ids)
                     rollout_state.response = returned_response
-                    rollout_state.response_ids = response_ids
                     rollout_state.logprobs = logprobs
                     rollout_state.routed_experts = routed_experts
                     rollout_state.finish_reason = finish_reason

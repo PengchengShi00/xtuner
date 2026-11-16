@@ -19,7 +19,6 @@ class ProvenanceTests(unittest.TestCase):
                 "s",
                 text,
                 TokenizedSegment(
-                    text=delta,
                     token_ids=[version * 10, version * 10 + 1],
                     expert_key=routes.copy(),
                     request_id=f"r{version}",
@@ -31,7 +30,6 @@ class ProvenanceTests(unittest.TestCase):
                 "s",
                 text,
                 TokenizedSegment(
-                    text=response,
                     token_ids=[version * 10 + 2, version * 10 + 3],
                     labels=[version * 10 + 2, version * 10 + 3],
                     logprobs=[-0.1 - version, -0.2 - version],
@@ -53,7 +51,7 @@ class ProvenanceTests(unittest.TestCase):
         # Ordinary prefix reading remains legal; conflicting writes fail.
         self.assertTrue(store.search("s", text)[0])
         with self.assertRaisesRegex(ValueError, "old_request_id=r2.*new_request_id=other"):
-            store.insert("s", text, TokenizedSegment(text="other", token_ids=[99], request_id="other", model_step=3))
+            store.insert("s", text, TokenizedSegment(token_ids=[99], request_id="other", model_step=3))
         self.assertEqual(store.export_training_trace("s", text)["input_ids"], trace["input_ids"])
 
     def test_long_lived_trace_can_enumerate_and_release_without_recursion(self):

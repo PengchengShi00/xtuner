@@ -31,7 +31,7 @@ class _RemoteGenerate:
         rollout_state.status = self.statuses_by_uid[rollout_state.rollout_id]
         if rollout_state.status == Status.COMPLETED:
             rollout_state.response = f"response {rollout_state.rollout_id}"
-            rollout_state.response_ids = [rollout_state.rollout_id or 0]
+            rollout_state.append_response_tokens([rollout_state.rollout_id or 0])
             rollout_state.finish_reason = "stop"
         elif rollout_state.status == Status.ABORTED:
             rollout_state.finish_reason = "abort"
@@ -93,7 +93,6 @@ class TestSingleTurnAgentLoop(unittest.IsolatedAsyncioTestCase):
             prompt_ids=[uid],
             tokens=None,
             response=None,
-            response_ids=None,
             status=Status.INIT,
             extra_fields={},
         )

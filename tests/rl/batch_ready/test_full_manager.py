@@ -29,7 +29,7 @@ class Fixture:
    if g==3:await asyncio.Event().wait()
    for k,item in enumerate(group):
     async with self.control.gate.request(str(item.session_id)) as lease:
-     item.status=Status.COMPLETED;item.reward={'score':k};item.response_ids=[2];item.response_model_steps=[lease.model_step];item.num_tokens=2;item.set_training_fields(input_ids=[1,2],labels=[-100,2],logprobs=[0.,-.2])
+     item.status=Status.COMPLETED;item.reward={'score':k};item.append_response_tokens([2]);item.response_model_steps=[lease.model_step];item.num_tokens=2;item.set_training_fields(input_ids=[1,2],labels=[-100,2],logprobs=[0.,-.2])
      lease.settlement=SettlementReceipt(True,True,'trace_committed');self.history.append((g,item.rollout_id,lease.model_step))
    return group
   finally:
@@ -64,7 +64,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
    group=await f.sample()
    # Fixture completed before this final window; no model call behind sealed gate.
    for k,item in enumerate(group):
-    item.status=Status.COMPLETED;item.reward={'score':k};item.response_ids=[2];item.response_model_steps=[1];item.num_tokens=2;item.set_training_fields(input_ids=[1,2],labels=[-100,2],logprobs=[0.,-.2])
+    item.status=Status.COMPLETED;item.reward={'score':k};item.append_response_tokens([2]);item.response_model_steps=[1];item.num_tokens=2;item.set_training_fields(input_ids=[1,2],labels=[-100,2],logprobs=[0.,-.2])
    await f.buffer.put(group,'task',model_step=1,current_train_step=3,stale_threshold=3)
    three=await f.produce(3,True);self.assertEqual(three.rollout_states[0][0].group_id,4)
    await f.cancelled.wait();self.assertFalse(f.cleanup.is_set());self.assertEqual(f.strategy.pending_task_count(),0)

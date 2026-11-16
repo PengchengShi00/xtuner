@@ -2,7 +2,7 @@
 
 `Judger` 是 XTuner RL 中负责给 rollout 结果打分的组件。它接收 `RolloutState`，读取模型生成结果和标签，计算 reward，并把分数写回 `rollout_state.reward`。后续的 advantage 计算、训练数据构建和默认评测逻辑都会依赖这个字段。
 
-在典型流程中，`AgentLoop` 先调用推理引擎生成 `response_ids`，再把 token 解码成文本形式的 `response`，最后通过 `run_judger()` 调用 `judger.judge(rollout_state)` 或 `judger.batch_judge(rollout_states)`。
+在典型流程中，`AgentLoop` 先调用推理引擎生成 response token（`RolloutState.response_ids` 派生视图），再把 token 解码成文本形式的 `response`，最后通过 `run_judger()` 调用 `judger.judge(rollout_state)` 或 `judger.batch_judge(rollout_states)`。
 
 ## Judger 类型
 
@@ -125,9 +125,9 @@ async def batch_judge(self, rollout_states: list[RolloutState]) -> list[RolloutS
 在预置 `SingleTurnAgentLoop` 中，进入 Judger 前的 `RolloutState` 通常已经包含：
 
 - `prompt_ids`：prompt token，后续训练 controller 会用它拼接训练输入。
-- `response_ids`：模型生成的 response token，后续训练数据直接依赖它。
+- `response_ids`：模型生成的 response token，是 `input_ids[prompt_length:]` 的只读派生视图；后续训练数据直接依赖它。
 - `response`：模型生成的文本，`NativeJudger` 会用它计算 reward。
-- `logprobs`：response token 的 rollout logprob。如果存在，长度必须和 `response_ids` 一致。
+- `logprobs`：response token 的 rollout logprob。如果存在，推理期长度必须和 response 后缀（`response_length`）一致。
 - `labels`：监督目标（labels 是唯一监督载体，语义上不参与训练的位置为 `-100`）。prompt+response 型样本由 loop 侧 `canonicalize_train_fields()` 兜底构造。
 - `reward_model["ground_truth"]`：标准答案或标签，预置 rule-based Judger 通常依赖这个字段。
 
@@ -159,9 +159,9 @@ rollout_state.reward = {
 - `reward` 不能为 `None`。
 - `reward` 必须包含数值型 `score` 字段，因为 controller 会直接读取 `data.reward["score"]` 来计算 advantage。
 - `status` 不能是 `ABORTED`、`FILTERED` 或 `FAILED`。
-- `response` 和 `response_ids` 都不能为空。
+- `response` 非空，且 response 后缀非空（`response_length > 0`）。
 - labels 中 `-100` 的位置不参与训练，对应 advantage 也会置为 `0.0`。
-- 如果提供 `logprobs`，长度必须和 `response_ids` 一致。
+- 如果提供 `logprobs`，长度必须和 response 后缀（或已组装的 `input_ids`）一致。
 
 其他 reward 字段可以按任务需要扩展，例如 `acc`、`format`、`tool_ok`、`reason` 等。
 

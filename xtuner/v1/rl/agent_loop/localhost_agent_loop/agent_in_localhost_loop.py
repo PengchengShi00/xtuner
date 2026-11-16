@@ -272,14 +272,16 @@ class AgentInLocalhostLoop(AgentLoop):
         prompt_text = text[:-1] if text.endswith("\n") else text
         data = await get_store().export_training_trace.remote(str(rollout_state.session_id), prompt_text)
 
+        # 训练字段被新 trace 整体覆盖；上一轮发布的 train_meta/num_tokens 作废，
+        # 由 set_training_fields 按新 prompt 边界重新推导。
+        rollout_state.train_meta = None
+        rollout_state.num_tokens = None
         rollout_state.input_ids = data["input_ids"]
         rollout_state.labels = data["labels"]
-        # Unified response_ids convention: the contiguous suffix of input_ids after the prompt
-        # (env-injected tokens included), aligned with response_model_steps for per-token
-        # staleness; also the token count used by rollout throughput logging.
+        # Unified response suffix convention: the contiguous suffix of input_ids after the prompt
+        # (env-injected tokens included), derived from input_ids + prompt_length.
         rollout_state.prompt_ids = list(data["prompt_ids"])
-        prompt_len = len(rollout_state.prompt_ids)
-        rollout_state.response_ids = list(data["response_ids"])
+        rollout_state.prompt_length = len(rollout_state.prompt_ids)
         rollout_state.logprobs = data["logprobs"]
         rollout_state.routed_experts = data["routed_experts"]
         content = response_message.get("content")
@@ -292,8 +294,8 @@ class AgentInLocalhostLoop(AgentLoop):
         rollout_state.finish_reason = str(response_message.get("finish_reason") or ("stop" if is_success else "error"))
         rollout_state.reward = {"score": item.reward if is_success and item.reward is not None else 0.0}
         rollout_state.input_ids = None
+        rollout_state.prompt_length = None
         rollout_state.labels = None
-        rollout_state.response_ids = None
         rollout_state.logprobs = None
         rollout_state.routed_experts = None
         rollout_state.response_model_steps = None

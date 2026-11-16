@@ -123,9 +123,8 @@ class TestTokenStalenessMask(unittest.TestCase):
         # 有效掩码只由 token staleness 决定。
         state = self._state(response_model_steps=[0, 4])
         state.reset_response()
-        state.response_ids = [3, 4]
+        state.append_response_tokens([3, 4])
         state.response_model_steps = [4, 4]
-        state.input_ids = [1, 2, 3, 4]
         state.labels = [-100, -100, 3, 4]
         state.set_training_fields(input_ids=state.input_ids, labels=state.labels, logprobs=None)
 
@@ -138,15 +137,16 @@ class TestTokenStalenessMask(unittest.TestCase):
         self.assertEqual(masks, [[1, 1]])
         self.assertEqual(state.labels, [-100, -100, 3, 4])
 
-    def test_reset_clears_canonical_train_fields(self):
-        # 回归：reset 必须清掉上一轮 canonicalize 写入的 input_ids/labels，
-        # 否则重 roll 后基类 canonicalize 跳过重建，训练字段与新生成的 response 错位。
+    def test_reset_truncates_sequence_to_prompt_prefix(self):
+        # 回归：reset 保留 prompt 前缀并丢弃 response 后缀与 labels，重 roll 时直接续写；
+        # 若残留旧 labels，基类 canonicalize 会把它们当作已组装字段。
         state = self._state(response_model_steps=[0, 4])
         state.input_ids = [1, 2, 3, 4]
 
         state.reset_response()
 
-        self.assertIsNone(state.input_ids)
+        self.assertEqual(state.input_ids, [1, 2])
+        self.assertEqual(state.response_ids, [])
         self.assertIsNone(state.labels)
 
     def test_full_sequence_agentic_stale_clears_all_supervised_labels(self):
@@ -157,7 +157,7 @@ class TestTokenStalenessMask(unittest.TestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[30, -1, 40, -1, 32],
+            prompt_length=2,
             response_model_steps=[0, 0, 0, 0, 0],
             input_ids=[1, 2, 30, -1, 40, -1, 32],
             labels=[-100, -100, 30, -100, 40, -100, 32],
@@ -181,7 +181,7 @@ class TestTokenStalenessMask(unittest.TestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[30, -1, 40, -1, 32],
+            prompt_length=2,
             response_model_steps=[0, 4, 4, 4, 4],
             input_ids=[1, 2, 30, -1, 40, -1, 32],
             labels=[-100, -100, 30, -100, 40, -100, 32],
@@ -204,7 +204,7 @@ class TestTokenStalenessMask(unittest.TestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[30, -1, 40, -1, 32],
+            prompt_length=2,
             response_model_steps=[4, 4, 4, 4, 4],
             input_ids=[1, 2, 30, -1, 40, -1, 32],
             labels=[-100, -100, 30, -100, 40, -100, 32],
@@ -227,7 +227,7 @@ class TestTokenStalenessMask(unittest.TestCase):
             rollout_id=1,
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
-            response_ids=[3, 4],
+            prompt_length=0,
             response_model_steps=[0, 4],
             input_ids=[3, 4],
             labels=[3, 4],
@@ -290,7 +290,7 @@ class TestTokenStalenessMask(unittest.TestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1, 2],
-            response_ids=[3, 4],
+            prompt_length=2,
             response_model_steps=response_model_steps,
         )
         # prompt+response 形态：response_ids 是序列的连续尾段，labels 为全序列监督。

@@ -84,17 +84,17 @@ AgentLoop 输入和输出都是 `RolloutState`。如果后续使用预置 `RLTra
 AgentLoop 返回的 `RolloutState` 如果要进入训练，至少需要满足：
 
 - `status == Status.COMPLETED`。预置 trainer 会跳过 `ABORTED`、`FILTERED`、`FAILED` 的样本组。
-- `response_ids` 非空。`canonicalize_train_fields()` 用它构造训练 token。
+- `input_ids` 已从第一轮起维护，且 response 后缀非空。`canonicalize_train_fields()` 只补 labels 并发布 `TrainMeta`。
 - `response` 非空。Judger 和轨迹保存依赖文本 response。
 - `reward["score"]` 存在。训练 controller 会直接读取它计算 advantage。
 
 如果提供以下字段，还需要满足长度约定：
 
-- `logprobs`：长度必须等于 `len(response_ids)`。
+- `logprobs`：长度等于 response 后缀长度（推理期）或 `len(input_ids)`（已组装的全序列）。
 
-labels 是唯一的监督载体。`AgentLoop.generate_group()` 会在末尾调用 `canonicalize_train_fields()`，为 prompt+response 型样本构造全序列 `input_ids`/`labels`/`logprobs`（三者等长、未 shift）。这也是自定义 AgentLoop 最容易出错的地方：工具返回、环境反馈、系统插入内容等不是模型生成的 token，不参与训练——对应 label 直接写 `-100`，`logprobs` 填 `0.0`。prompt+response 型样本不需要手动构造这些字段（基类会兜底）；自行组装全序列的多轮 loop 则必须自己把语义洞烙进 labels。训练侧只做 shift 和 advantage 计算，不处理任何掩码。
+labels 是唯一的监督载体。`AgentLoop.generate_group()` 会在末尾调用 `canonicalize_train_fields()`：`input_ids` 已存在时只补 `labels`（response 段全部监督）并发布 `TrainMeta`；只有 `input_ids` 缺失的纯文本/外部 loop 才由基类 tokenize `response` 兜底。工具返回、环境反馈、系统插入内容等不是模型生成的 token 不参与训练——对应 label 直接写 `-100`，`logprobs` 填 `0.0`。prompt+response 型样本不需要手动构造这些字段；自行组装全序列的多轮 loop 则必须自己把语义洞烙进 labels。训练侧只做 shift 和 advantage 计算，不处理任何掩码。
 
-`response_ids` 统一约定为 `input_ids` 去掉 prompt 前缀的连续后缀（`len(response_ids) == len(input_ids) - len(prompt_ids)`，环境插入或工具返回的 token 也包含在内）；`response_model_steps` 与之等长，记录每位 token 的来源模型版本。token 级 staleness 据此对 prompt+response 与 agentic 全序列样本统一生效：逐 token 判定新鲜度，过期 token 的 label 烙成 `-100`，语义洞位（label 为 `-100`）不受影响。
+`RolloutState` 从第一轮生成起维护 `input_ids` 与 `prompt_length`（训练 prompt 前缀长度）；推理引擎输出与工具/环境 token 都通过 `rollout_state.append_response_tokens(tokens)` 追加。`response_ids` 是只读派生视图 `input_ids[prompt_length:]`（环境插入或工具返回的 token 也包含在内）；`response_model_steps` 与之等长，记录每位 token 的来源模型版本。token 级 staleness 据此对 prompt+response 与 agentic 全序列样本统一生效：逐 token 判定新鲜度，过期 token 的 label 烙成 `-100`，语义洞位（label 为 `-100`）不受影响。发布后 `prompt_ids`/`tokens` 会被清空，但 `input_ids`/`prompt_length` 保留，`response_ids` 仍可派生。
 
 ## SingleTurnAgentLoop
 
@@ -148,7 +148,7 @@ agent_loop_config = SingleTurnAgentLoopConfig(
 自定义 AgentLoop 通常需要做四件事：
 
 1. 继承 `AgentLoop`，实现 `generate_sample()`。
-2. 在 `generate_sample()` 中维护 `tokens`、`sample_params`、`response_ids`、`response`、`logprobs`、`status`，不要在这里调用外部 Judger。prompt+response 型样本的训练字段（`input_ids`/`labels`）由基类 `canonicalize_train_fields()` 兜底构造；自行组装全序列的 loop 需自己写 `input_ids`/`labels`，并把语义洞直接烙进 labels，同时把 `response_ids` 写成 `input_ids` 去掉 prompt 前缀的连续后缀（含环境 token）。
+2. 在 `generate_sample()` 中维护 `tokens`、`sample_params`、`response`、`logprobs`、`status`；引擎输出与工具/环境 token 通过 `rollout_state.append_response_tokens(...)` 追加到 `input_ids`（第一轮会自动初始化 prompt 前缀与 `prompt_length`）。prompt+response 型样本的 `labels` 由基类 `canonicalize_train_fields()` 兜底构造；自行组装全序列的 loop 需自己写 `labels`，并把语义洞直接烙进 labels。不要在这里调用外部 Judger。
 3. 若覆盖 `generate_group()`，在其中显式编排 Teacher、Judger 和组级过滤；没有 validity check 时应让完成的样本尽早进入 Teacher，有 validity check 时应只把过滤通过的完整组发送给 Teacher。
 4. 继承 `AgentLoopConfig`，实现 `build_local()`，这样才能接入 `TaskSpecConfig.agent_loop_config`，并复用 Ray actor 构建逻辑。
 
@@ -190,7 +190,7 @@ class CustomAgentLoopConfig(AgentLoopConfig):
         )
 ```
 
-这个版本适合没有工具、没有环境反馈、没有多轮上下文拼接的任务。只要 `RolloutController.generate()` 能正确写入 `response_ids`、`response`、`logprobs` 和 `status`，后续 Judger 与训练数据准备就能复用默认链路。
+这个版本适合没有工具、没有环境反馈、没有多轮上下文拼接的任务。`RolloutController.generate()` 会把引擎输出 append 到 `rollout_state.input_ids` 的 response 后缀，并写入 `response`、`logprobs` 和 `status`，后续 Judger 与训练数据准备复用默认链路。
 
 ### 多轮或工具调用实现
 
@@ -199,68 +199,61 @@ class CustomAgentLoopConfig(AgentLoopConfig):
 ```python
 class ToolAgentLoop(AgentLoop):
     async def generate_sample(self, rollout_state: RolloutState, **kwargs) -> RolloutState:
-        final_response_ids: list[int] = []
         final_logprobs: list[float] = []
         final_supervised: list[int] = []
-
-        cur_tokens = list(rollout_state.tokens or rollout_state.prompt_ids or [])
-        remaining_tokens = self.sample_params.max_tokens
+        max_tokens = self.sample_params.max_tokens
+        prompt_length = rollout_state.effective_prompt_length()
+        assert prompt_length is not None
 
         for _ in range(self.max_turns):
-            rollout_state.tokens = cur_tokens
-            rollout_state.sample_params = self.sample_params.model_copy(
-                update={"max_tokens": remaining_tokens}
-            )
-
-            rollout_state = await self.rollout_ctl.generate.remote(rollout_state)
-            if rollout_state.status != Status.COMPLETED:
+            response_length = rollout_state.response_length
+            if response_length >= max_tokens:
                 break
 
-            response_ids = list(rollout_state.response_ids or [])
-            logprobs = list(rollout_state.logprobs or [])
-            assert len(response_ids) == len(logprobs)
+            # 每轮都是一次新的引擎调用：重置 status，并把 prompt+历史 suffix 作为输入。
+            rollout_state.status = Status.INIT
+            rollout_state.tokens = list(rollout_state.input_ids or rollout_state.prompt_ids or [])
+            rollout_state.sample_params = self.sample_params.model_copy(
+                update={"max_tokens": max_tokens - response_length}
+            )
 
-            final_response_ids.extend(response_ids)
-            final_logprobs.extend(logprobs)
-            final_supervised.extend([1] * len(response_ids))
-            cur_tokens.extend(response_ids)
+            before = rollout_state.response_length
+            rollout_state = await self.rollout_ctl.generate.remote(rollout_state)
+            if rollout_state.status != Status.COMPLETED:
+                return rollout_state
+
+            # worker 已把本轮模型 token append 到 input_ids；这里只记录 logprobs 与监督位。
+            generated = rollout_state.response_length - before
+            final_logprobs.extend(list(rollout_state.logprobs or [])[-generated:] if generated else [])
+            final_supervised.extend([1] * generated)
 
             tool_tokens = self._run_tool_and_encode_result(rollout_state)
             if not tool_tokens:
                 break
-
-            final_response_ids.extend(tool_tokens)
+            rollout_state.append_response_tokens(tool_tokens)
             final_logprobs.extend([0.0] * len(tool_tokens))
             final_supervised.extend([0] * len(tool_tokens))
-            cur_tokens.extend(tool_tokens)
 
-            remaining_tokens = self.sample_params.max_tokens - len(final_response_ids)
-            if remaining_tokens <= 0:
-                break
-
-        rollout_state.response_ids = final_response_ids[: self.sample_params.max_tokens]
-        rollout_state.logprobs = final_logprobs[: self.sample_params.max_tokens]
-        supervised = final_supervised[: self.sample_params.max_tokens]
-        rollout_state.response = self.tokenizer.decode(rollout_state.response_ids)
-
-        # 语义洞直接烙进 labels：工具/环境 token 的 label 为 -100，不参与训练。
-        prompt_ids = list(rollout_state.prompt_ids or [])
-        rollout_state.input_ids = prompt_ids + list(rollout_state.response_ids)
-        rollout_state.labels = [-100] * len(prompt_ids) + [
-            resp_id if flag else -100 for resp_id, flag in zip(rollout_state.response_ids, supervised)
+        # 按 max_tokens 截断；工具/环境 token 的 label 写 -100，不参与训练。
+        del rollout_state.input_ids[prompt_length + max_tokens :]
+        response_ids = list(rollout_state.response_ids or [])
+        rollout_state.labels = [-100] * prompt_length + [
+            resp_id if keep else -100
+            for resp_id, keep in zip(response_ids, final_supervised[: len(response_ids)])
         ]
-
-        assert len(rollout_state.input_ids) == len(rollout_state.labels) == len(rollout_state.logprobs)
+        rollout_state.logprobs = [0.0] * prompt_length + final_logprobs[: len(response_ids)]
+        rollout_state.response = self.tokenizer.decode(response_ids)
 
         if rollout_state.status == Status.COMPLETED and self.judger is not None and not self.enable_batch_judge:
             rollout_state = await self.run_judger(rollout_state)
         return rollout_state
 ```
 
-这个例子强调两个约定：
+这个例子强调三个约定：
 
-- 模型生成 token 的 label 保留 token id（参与训练）。
-- 工具或环境插入 token 的 label 写 `-100`，`logprobs` 填 `0.0`。
+- 模型生成 token 与工具/环境 token 都追加到同一条 `input_ids`，不单独维护 response 字段。
+- 模型生成 token 的 label 保留 token id（参与训练）；工具或环境插入 token 的 label 写 `-100`，`logprobs` 填 `0.0`。
+- 每轮引擎调用前重置 `status = Status.INIT`，否则 worker 会因上一次 `COMPLETED` 直接早退。
 
 ### 覆盖 generate_group
 
@@ -309,7 +302,7 @@ class CustomAgentLoop(AgentLoop):
         return rollout_state
 ```
 
-如果任务的多轮上下文、工具结果或环境状态不能用默认 handler 合并，需要自己定义续跑逻辑。核心原则是：续跑后的 `response_ids`、`response`、`logprobs`（以及自组装 loop 的 `input_ids`/`labels`）必须仍然表示完整 response，而不是只有本轮新增部分。
+如果任务的多轮上下文、工具结果或环境状态不能用默认 handler 合并，需要自己定义续跑逻辑。核心原则是：续跑后的 `input_ids`/`response_ids`、`response`、`logprobs`（以及自组装 loop 的 `labels`）必须仍然表示完整 response，而不是只有本轮新增部分；`PartialRolloutHandler.postprocess` 只把本次新增 token append 到 `input_ids`，历史部分保持不变。
 
 ## 在训练配置中使用
 
@@ -348,9 +341,9 @@ agent_loop_manager_cfg = AgentLoopManagerConfig(
 - `generate_sample()` 是否只处理单条 `RolloutState`。
 - 推理前是否设置了 `rollout_state.tokens`。
 - 每次调用 `rollout_ctl.generate.remote()` 前是否设置了本轮 `sample_params`。
-- 返回训练前，`response_ids`、`response`、`logprobs` 是否完整且长度一致；自组装全序列的 loop 还需保证 `input_ids`/`labels` 齐全且等长。
+- 返回训练前，`input_ids`/response 后缀、`response`、`logprobs` 是否完整且长度一致；自组装全序列的 loop 还需保证 `labels` 与 `input_ids` 等长。
 - 非模型生成 token 的 label 是否已写 `-100`（prompt+response 型样本由基类 canonicalize 兜底；自组装 loop 自行烙入）。
-- `response_ids` 是否为 `input_ids` 去掉 prompt 前缀的连续后缀（`len(response_ids) == len(input_ids) - len(prompt_ids)`）。
+- `response_ids`（派生视图）是否等于 `input_ids[prompt_length:]`（`len(response_ids) == len(input_ids) - prompt_length`）。
 - 需要 Judger 时，是否通过 `self.run_judger(...)` 调用打分，以复用 pause/cancel 处理。
 - 是否保证最终有 `reward["score"]`。
 - 若使用 async partial rollout，是否正确处理 `enable_partial_rollout` 和历史 response 合并。

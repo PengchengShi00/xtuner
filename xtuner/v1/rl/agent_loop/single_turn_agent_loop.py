@@ -74,7 +74,7 @@ class SingleTurnAgentLoop(AgentLoop):
         if not rollout_state.tokens:
             rollout_state.tokens = rollout_state.prompt_ids
 
-        # 推理引擎generate, 生成的结果会覆盖到 rollout_state.response_ids 上
+        # 推理引擎 generate；worker 把本次输出 append 到 rollout_state.input_ids 上
         assert self.rollout_ctl is not None
         rollout_state = await trace_rollout_remote(
             self.rollout_ctl.generate,  # type: ignore[attr-defined]

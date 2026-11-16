@@ -25,7 +25,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import ray
@@ -63,6 +63,11 @@ def make_rollout_state(
     prompt_ids = list(prompt_ids) if prompt_ids is not None else [uid, uid + 1000]
     response_ids = list(response_ids) if response_ids is not None else [uid + 10]
     logprobs = list(logprobs) if logprobs is not None else [0.1 for _ in response_ids]
+    if input_ids is None:
+        input_ids = list(prompt_ids) + response_ids
+        prompt_length = len(prompt_ids)
+    else:
+        prompt_length = len(prompt_ids) if prompt_length is None else prompt_length
     return RolloutState(
         rollout_id=uid,
         group_id=uid,
@@ -71,7 +76,8 @@ def make_rollout_state(
         session_id=session_id,
         tokens=list(tokens) if tokens is not None else list(prompt_ids),
         response=response if response is not None else f"response {uid}",
-        response_ids=response_ids,
+        input_ids=list(input_ids) if input_ids is not None else None,
+        prompt_length=prompt_length,
         response_model_steps=list(response_model_steps) if response_model_steps is not None else None,
         logprobs=logprobs,
         routed_experts=routed_experts,
@@ -82,7 +88,6 @@ def make_rollout_state(
         status=status,
         mm_info=mm_info,
         extra_fields=dict(extra_fields or {}),
-        input_ids=input_ids,
         labels=labels,
     )
 
@@ -365,6 +370,8 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 replay_buffer = replay_buffer_config_cls().build()
                 stale = make_rollout_state(
                     1,
+                    prompt_ids=[1],
+                    response_ids=[2],
                     response="stale agentic response",
                     response_model_steps=[0],
                     input_ids=[1, 2],
@@ -372,6 +379,8 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 )
                 fresh = make_rollout_state(
                     2,
+                    prompt_ids=[3],
+                    response_ids=[4],
                     response="fresh agentic response",
                     response_model_steps=[4],
                     input_ids=[3, 4],
@@ -519,6 +528,64 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 assert await replay_buffer.count("retryable_task", Status.EXPIRED) == 1
                 assert len(replay_buffer) == 1
                 assert await replay_buffer.get(1, "non_retryable_task", Status.EXPIRED) == []
+
+    async def test_retryable_expired_resets_state_before_releasing_trace_session(self):
+        # tail batch 可重试的过期样本：锁内先 reset（EXPIRED 可见即可重试），锁外释放
+        # trace session；随 session 释放的 routed_experts 不得在本地二次 free。
+        replay_buffer = SyncReplayBufferConfig().build()
+        stale = make_rollout_state(1, session_id=42, response_model_steps=[0])
+        stale.routed_experts = [MagicMock()]
+        await replay_buffer.put([stale], "task")
+
+        with (
+            patch(
+                "xtuner.v1.rl.replay_buffer.release_existing_sessions",
+                new=AsyncMock(return_value={"42"}),
+            ) as release_sessions,
+            patch("xtuner.v1.rl.utils.ray_utils.free_object_refs") as free_refs,
+        ):
+            expired_counts = await replay_buffer.refresh_staleness(
+                task_stale_thresholds={"task": 1},
+                expired_groups_retryable_by_task={"task": True},
+                current_train_step=2,
+            )
+
+        self.assertEqual(expired_counts, {"task": 1})
+        release_sessions.assert_awaited_once_with(["42"])
+        free_refs.assert_not_called()
+        self.assertEqual(stale.status, Status.EXPIRED)
+        self.assertIsNone(stale.routed_experts)
+        self.assertEqual(stale.response_ids, [])
+        self.assertIsNone(stale.input_ids)
+
+    async def test_retryable_expired_keeps_session_with_surviving_group_member(self):
+        # 同组仍有存活样本引用同一 session 时（sandbox 一拆多 segment），不提前释放：
+        # 存活 segment 的 routed_experts 借用的是同一棵树里的引用。
+        replay_buffer = SyncReplayBufferConfig().build()
+        stale = make_rollout_state(1, session_id=42, response_model_steps=[0])
+        stale.routed_experts = [MagicMock()]
+        fresh = make_rollout_state(2, session_id=42, response_model_steps=[4])
+        await replay_buffer.put([stale, fresh], "task")
+
+        with (
+            patch(
+                "xtuner.v1.rl.replay_buffer.release_existing_sessions",
+                new=AsyncMock(return_value=set()),
+            ) as release_sessions,
+            patch("xtuner.v1.rl.utils.ray_utils.free_object_refs") as free_refs,
+        ):
+            await replay_buffer.refresh_staleness(
+                task_stale_thresholds={"task": 1},
+                expired_groups_retryable_by_task={"task": True},
+                current_train_step=2,
+            )
+
+        release_sessions.assert_awaited_once_with([])
+        free_refs.assert_not_called()
+        self.assertEqual([item.status for item in (stale, fresh)], [Status.EXPIRED, Status.COMPLETED])
+        self.assertIsNone(stale.routed_experts)
+        self.assertEqual(stale.response_ids, [])
+        self.assertEqual(fresh.response_ids, [12])
 
     async def test_refresh_staleness_batches_non_retryable_release_outside_lock(self):
         replay_buffer = AsyncReplayBufferConfig().build()

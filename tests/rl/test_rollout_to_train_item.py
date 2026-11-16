@@ -91,7 +91,7 @@ class TestTrainBatchContract(unittest.TestCase):
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=resolved_prompt_ids,
             response="response",
-            response_ids=resolved_response_ids,
+            prompt_length=len(resolved_prompt_ids),
             logprobs=logprobs,
             status=Status.COMPLETED,
             finish_reason="stop",

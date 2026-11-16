@@ -114,7 +114,9 @@ class _FakeRolloutController:
         # 生成侧只补齐训练真正需要的可观察 rollout 结果，不加载真实推理服务。
         rollout_state.status = Status.COMPLETED
         rollout_state.response = "ok"
-        rollout_state.response_ids = [100, 101]
+        if rollout_state.input_ids is None and not (rollout_state.prompt_ids or rollout_state.tokens):
+            rollout_state.prompt_ids = [1]
+        rollout_state.append_response_tokens([100, 101])
         reward_score = 1.0 if int(rollout_state.rollout_id) % 2 == 0 else 0.5
         rollout_state.reward = {"score": reward_score}
         return rollout_state

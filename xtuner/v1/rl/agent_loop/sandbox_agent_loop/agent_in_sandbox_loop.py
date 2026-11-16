@@ -6,7 +6,7 @@ import importlib
 import json
 import traceback
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from lagent.utils import create_object
 from pydantic import Field
@@ -329,8 +329,12 @@ class AgentInSandboxLoop(AgentLoop):
             # This loop returns terminal Agent executions, never partial continuations.
             # Retire HTTP ownership after runner completion/cancellation, independently
             # of later filtering or replay consumption; keep trace ownership unchanged.
-            if self.retire_route_on_completion and self.rollout_ctl is not None and rollout_state.session_id is not None:
-                await self.rollout_ctl.retire_route_sessions.remote([str(rollout_state.session_id)])
+            if (
+                self.retire_route_on_completion
+                and self.rollout_ctl is not None
+                and rollout_state.session_id is not None
+            ):
+                await cast(Any, self.rollout_ctl.retire_route_sessions).remote([str(rollout_state.session_id)])
 
     async def _run_item(self, item: AgentRolloutItem) -> AgentRolloutItem:
         runner = _resolve_runner(item.pipeline, str(item.uid))
@@ -399,14 +403,17 @@ class AgentInSandboxLoop(AgentLoop):
             )
             prompt_text = text[:-1] if text.endswith("\n") else text
             data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
+            # model_copy 会携带上一轮发布的 train_meta/num_tokens；训练字段已被新 trace
+            # 整体覆盖，摘要必须作废并由 set_training_fields 按新 prompt 边界重新推导。
+            segment_state.train_meta = None
+            segment_state.num_tokens = None
             segment_state.input_ids = data["input_ids"]
             segment_state.labels = data["labels"]
-            # Unified response_ids convention: the contiguous suffix of input_ids after the prompt
-            # (env-injected tokens included), aligned with response_model_steps for per-token
-            # staleness; also the token count used by rollout throughput logging.
+            # Unified response suffix convention: the contiguous suffix of input_ids after the prompt
+            # (env-injected tokens included), derived from input_ids + prompt_length.
             segment_state.prompt_ids = list(data["prompt_ids"])
             prompt_len = len(segment_state.prompt_ids)
-            segment_state.response_ids = list(data["response_ids"])
+            segment_state.prompt_length = prompt_len
             segment_state.logprobs = data["logprobs"]
             # ``routed_experts`` is a per-node list for a MoE trace or ``None`` for a dense one; trace_store's
             # ``_resolve_routed_experts`` already enforces the all-or-nothing invariant (a trace mixing MoE turns with
@@ -420,11 +427,11 @@ class AgentInSandboxLoop(AgentLoop):
                 # positions. Versions must follow the same positions, not only
                 # the supervised labels. Preserve each original request's lease.
                 versions = data.get("token_model_steps", [])[prompt_len:]
-                if len(versions) != len(segment_state.response_ids) or any(v is None for v in versions):
+                if len(versions) != len(data["response_ids"]) or any(v is None for v in versions):
                     raise ValueError("Missing request-time response model versions")
                 if not data["routed_experts"]:
                     raise ValueError("turn-resume MoE training requires routed experts on every node")
-                records = _load_messages_artifact(item.artifacts)
+                records = _load_messages_artifact(item.artifacts) or []
                 matching = [
                     record for record in records if record.get("messages") == messages and record.get("tools") == tools
                 ]
@@ -440,8 +447,11 @@ class AgentInSandboxLoop(AgentLoop):
                     raise ValueError("Agent transcript request IDs do not match committed trace")
                 segment_state.response_model_steps = versions
                 segment_state.extra_fields["request_ids"] = data["request_ids"]
-            if segment_state.response_ids:
-                segment_state.response = self.tokenizer.decode(segment_state.response_ids)
+            else:
+                # model_copy 会携带父样本的 versions；新 trace 的 suffix 长度可能已变化。
+                segment_state.response_model_steps = None
+            if data["response_ids"]:
+                segment_state.response = self.tokenizer.decode(data["response_ids"])
             else:
                 segment_state.response = _response_text(response_message)
             rollout_states.append(segment_state)
@@ -456,8 +466,8 @@ class AgentInSandboxLoop(AgentLoop):
         rollout_state.finish_reason = str(response_message.get("finish_reason") or ("stop" if is_success else "error"))
         rollout_state.reward = {"score": item.reward if is_success and item.reward is not None else 0.0}
         rollout_state.input_ids = None
+        rollout_state.prompt_length = None
         rollout_state.labels = None
-        rollout_state.response_ids = None
         rollout_state.logprobs = None
         rollout_state.routed_experts = None
         rollout_state.response_model_steps = None

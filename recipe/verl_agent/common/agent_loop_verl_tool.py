@@ -7,9 +7,9 @@ from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.workers.rollout.replica import TokenOutput
 
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
+from xtuner.v1.rl.agent_loop import AgentLoop, AgentLoopConfig
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout.controller import RolloutControllerProxy
-from xtuner.v1.rl.agent_loop import AgentLoop, AgentLoopConfig
 
 
 class VerlToolAgentLoopConfig(AgentLoopConfig):
@@ -59,6 +59,7 @@ class XtunerAsyncLLMServerManager:
 
         rollout_state = RolloutState(
             message=[],
+            prompt_ids=list(prompt_ids),
             tokens=prompt_ids,
             session_id=session_id,
             sample_params=sample_params,
@@ -139,7 +140,7 @@ class VerlToolAgentLoop(AgentLoop):
         response_ids = list(output.response_ids)
         semantic_mask = output.response_mask if output.response_mask is not None else [1] * len(response_ids)
         rollout_state.prompt_ids = prompt_ids
-        rollout_state.response_ids = response_ids
+        rollout_state.prompt_length = len(prompt_ids)
         rollout_state.logprobs = (
             None if output.response_logprobs is None else [0.0] * len(prompt_ids) + list(output.response_logprobs)
         )
@@ -151,7 +152,7 @@ class VerlToolAgentLoop(AgentLoop):
         rollout_state.status = Status.COMPLETED
         rollout_state.extra_fields.update(output.extra_fields)
         # judger needs response in text format
-        rollout_state.response = self.tokenizer.decode(rollout_state.response_ids)
+        rollout_state.response = self.tokenizer.decode(response_ids)
         # for trajectory dump, we need to add raw_prompt to extra_fields
         # raw_prompt is updated in tool_agent_loop: apply_chat_template of tools
         rollout_state.extra_fields["raw_prompt"] = self.tokenizer.decode(rollout_state.prompt_ids)
@@ -159,5 +160,5 @@ class VerlToolAgentLoop(AgentLoop):
         # judge rollout_state
         if self.judger is not None:
             rollout_state = await self.judger.judge(rollout_state)
-        
+
         return rollout_state

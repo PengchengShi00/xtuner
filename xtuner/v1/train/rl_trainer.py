@@ -466,7 +466,9 @@ class RLColocateTrainerConfig(BaseRLTrainerConfig):
             if self.auto_resume and self.load_checkpoint_cfg.checkpoint_path is not None:
                 raise ValueError("Choose explicit checkpoint_path or auto_resume, not both")
             if self.load_checkpoint_cfg.checkpoint_path is not None or self.auto_resume:
-                if not (self.load_checkpoint_cfg.load_optimizer_states and self.load_checkpoint_cfg.load_optimizer_args):
+                if not (
+                    self.load_checkpoint_cfg.load_optimizer_states and self.load_checkpoint_cfg.load_optimizer_args
+                ):
                     raise ValueError("Full colocate resume requires optimizer states")
         return self
 
@@ -1480,10 +1482,11 @@ class BaseRLTrainer:
                     f.write("\n")
 
     def _get_trajectory_response_ids(self, data: RolloutState) -> list[int]:
-        if data.response_ids is not None:
-            if isinstance(data.response_ids, torch.Tensor):
-                return data.response_ids.flatten().tolist()
-            return data.response_ids
+        response_ids = data.response_ids
+        if response_ids is not None:
+            return response_ids
+        if data.input_ids is not None and data.train_meta is not None:
+            return data.input_ids[data.train_meta.prompt_length :]
         if data.input_ids is not None and data.labels is not None:
             return [label for label in data.labels[1:] if label != -100]
         if data.response is not None:
@@ -1720,9 +1723,15 @@ class RLColocateTrainer(BaseRLTrainer):
                                 self.train_batch_size,
                                 train_step=train_step,
                                 model_step=model_step,
-                                **({"quiesce": self._checkpoint_due(train_step) or train_step == self._total_train_steps,
-                                    "final": train_step == self._total_train_steps}
-                                   if self._turn_keepalive else {}),
+                                **(
+                                    {
+                                        "quiesce": self._checkpoint_due(train_step)
+                                        or train_step == self._total_train_steps,
+                                        "final": train_step == self._total_train_steps,
+                                    }
+                                    if self._turn_keepalive
+                                    else {}
+                                ),
                             )
                         )
                 finally:
@@ -1854,6 +1863,7 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
             )
         if self._debug_train:
             self.tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_path, trust_remote_code=True)
+            assert self._debug_rollout_dir is not None
             self._debug_train_files = self._list_debug_rollout_files(self._debug_rollout_dir)
             if cfg.total_train_steps is None:
                 self._total_train_steps = max(self._debug_train_files)

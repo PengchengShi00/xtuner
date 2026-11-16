@@ -15,7 +15,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
    for _ in range(2):
     ready=await f.sample()
     for k,item in enumerate(ready):
-     item.status=Status.COMPLETED;item.reward={'score':k};item.response_ids=[2];item.response_model_steps=[1];item.num_tokens=2
+     item.status=Status.COMPLETED;item.reward={'score':k};item.append_response_tokens([2]);item.response_model_steps=[1];item.num_tokens=2
     await f.buffer.put(ready,'task')
    final=await f.produce(3,True);self.assertEqual(final.rollout_states[0][0].group_id,4)
    f.cleanup.set();await asyncio.gather(*f.m._finalizing_tasks,return_exceptions=True)

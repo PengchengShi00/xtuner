@@ -140,7 +140,7 @@ class RolloutTeacherClient:
             state.extra_fields["teacher_score_time_s"] = time.perf_counter() - start
 
     def _prepare_scoring_input(self, state: RolloutState) -> tuple[list[int], list[int]] | None:
-        if state.input_ids is not None:
+        if state.input_ids is not None and state.labels is not None:
             input_ids = state.input_ids
             labels = state.labels
             if len(input_ids) < 2:

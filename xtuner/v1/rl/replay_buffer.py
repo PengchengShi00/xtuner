@@ -19,7 +19,7 @@ from xtuner.v1.data_proto.rl_data import (
     update_sample_version,
 )
 from xtuner.v1.data_proto.utils import calculate_seq_staleness
-from xtuner.v1.rl.rollout.trace_store import release_and_discard_rollout_groups
+from xtuner.v1.rl.rollout.trace_store import release_and_discard_rollout_groups, release_existing_sessions
 from xtuner.v1.rl.utils import (
     BetweenNode,
     ConditionNode,
@@ -431,6 +431,9 @@ class StalenessReplayPolicy(ReplayPolicy):
         return await storage_backend.count(query)
 
 
+_RetryReleaseItem: TypeAlias = tuple[list[RolloutState], RolloutState, Any]
+
+
 class ReplayBuffer:
     _SAVE_PATH = "replay_buffer.pth"
 
@@ -447,6 +450,7 @@ class ReplayBuffer:
         stale_threshold: int | None,
         token_stale_threshold: int | None,
         expired_groups_retryable: bool,
+        retry_release_items: list[_RetryReleaseItem] | None = None,
     ) -> Status:
         """Refresh one group's staleness, expire it when needed, and clean it
         up."""
@@ -456,6 +460,7 @@ class ReplayBuffer:
         # NOTE: An EXPIRED group may still contain COMPLETED states whose responses were preserved.
         # Refresh the group again so those states can also expire while waiting for rerollout.
         expired_mask = [item.status == Status.EXPIRED for item in group]
+        pre_expired_mask = list(expired_mask)
 
         # 1. update seq-level staleness
         refresh_seq_staleness(group, current_train_step)
@@ -478,14 +483,14 @@ class ReplayBuffer:
             elif (
                 item.status == Status.ABORTED
                 and item.labels is None
-                and item.response_ids
+                and item.response_length > 0
                 and token_stale_threshold is not None
             ):
                 # Partial responses have no training labels yet. Expire an entirely
                 # stale prefix without constructing or modifying training masks.
                 model_steps = item.response_model_steps
-                if model_steps is None or len(model_steps) != len(item.response_ids):
-                    raise ValueError("response_model_steps must align with response_ids")
+                if model_steps is None or len(model_steps) != item.response_length:
+                    raise ValueError("response_model_steps must align with the response suffix")
                 expired_mask[index] = all(
                     calculate_seq_staleness(step, current_train_step) >= token_stale_threshold for step in model_steps
                 )
@@ -496,15 +501,68 @@ class ReplayBuffer:
 
         # 4. cleanup sample or cleanup response for expired sample
         if expired_groups_retryable:
-            for item, expired in zip(group, expired_mask):
+            newly_expired: list[RolloutState] = []
+            for item, expired, pre_expired in zip(group, expired_mask, pre_expired_mask):
                 if expired:
                     item.status = Status.EXPIRED
-                    item.reset_response()
+                    if not pre_expired:
+                        newly_expired.append(item)
+            if newly_expired:
+                if retry_release_items is None:
+                    for item in newly_expired:
+                        item.reset_response()
+                else:
+                    for item in newly_expired:
+                        # 同步立即 reset（无 await）：EXPIRED 一旦能被 sampler 取到就必须已可重试。
+                        # routed_experts 的所有权交给释放 session 的异步流程统一结算。
+                        detached_refs = item.routed_experts
+                        item.routed_experts = None
+                        item.reset_response()
+                        retry_release_items.append((group, item, detached_refs))
         else:
             for item in group:
                 item.status = Status.EXPIRED
 
         return Status.EXPIRED
+
+    @staticmethod
+    async def _release_retryable_expired_sessions(retry_release_items: list[_RetryReleaseItem]) -> None:
+        """Release trace sessions of newly expired states and settle routed-
+        expert ownership.
+
+        过期项的字段已在 staleness 生命周期判定中同步 reset（锁内，或入 buffer 之前）； 这里只做 session 释放与引用结算，不修改 EXPIRED 后可被 sampler 取到的字段。 重试沿用原
+        session_id 重新生成；旧 trace 树不清掉会一直占用 store 内存， 并可能与新一轮写入冲突（request-aware 写入直接拒绝同 key 冲突）。 sandbox 一个 session
+        可能导出同组的多个 segment，仍被组内存活样本引用的 session 不能提前释放：存活 segment 的 routed_experts 借用的是同一棵树里的引用。 未被 store 释放、也没有幸存
+        segment 借用的引用在此本地释放；request-aware 引用由借用方负责，不在此释放。
+        """
+        if not retry_release_items:
+            return
+
+        from ray import ObjectRef
+
+        from xtuner.v1.rl.utils.ray_utils import free_object_refs
+
+        pending: list[tuple[RolloutState, Any, bool]] = []
+        candidate_session_ids: list[str] = []
+        for group, item, detached_refs in retry_release_items:
+            surviving_sessions = {
+                str(sibling.session_id)
+                for sibling in group
+                if sibling.session_id is not None and sibling.status != Status.EXPIRED
+            }
+            session_protected = item.session_id is not None and str(item.session_id) in surviving_sessions
+            pending.append((item, detached_refs, session_protected))
+            if item.session_id is not None and not session_protected:
+                candidate_session_ids.append(str(item.session_id))
+        released_session_ids = await release_existing_sessions(candidate_session_ids)
+        for item, detached_refs, session_protected in pending:
+            if detached_refs is None or session_protected or item.extra_fields.get("request_ids"):
+                continue
+            if item.session_id is not None and str(item.session_id) in released_session_ids:
+                # session 释放已 free 树内引用，本地句柄不得二次 free。
+                continue
+            if isinstance(detached_refs, (ObjectRef, list)):
+                free_object_refs(detached_refs)
 
     @staticmethod
     async def _discard_non_retryable_expired_groups(groups: list[list[RolloutState]]) -> None:
@@ -534,13 +592,16 @@ class ReplayBuffer:
         if model_step is not None:
             for item in items:
                 update_sample_version(item, model_step)
+        retry_release_items: list[_RetryReleaseItem] = []
         status = self._apply_staleness_lifecycle(
             items,
             current_train_step=current_train_step,
             stale_threshold=stale_threshold,
             token_stale_threshold=token_stale_threshold,
             expired_groups_retryable=expired_groups_retryable,
+            retry_release_items=retry_release_items,
         )
+        await self._release_retryable_expired_sessions(retry_release_items)
         staleness = max(item.seq_staleness for item in items)
         if status == Status.EXPIRED and not expired_groups_retryable:
             await self._discard_non_retryable_expired_groups([items])
@@ -585,6 +646,7 @@ class ReplayBuffer:
         retryable_by_task = expired_groups_retryable_by_task or {}
         token_stale_thresholds = task_token_stale_thresholds or {}
         non_retryable_expired_groups: list[list[RolloutState]] = []
+        retry_release_items: list[_RetryReleaseItem] = []
         async with self._lock:
             updated_records: list[StorageItem] = []
             deleted_uids: list[int] = []
@@ -605,6 +667,7 @@ class ReplayBuffer:
                         stale_threshold=stale_threshold,
                         token_stale_threshold=token_stale_thresholds.get(task_name),
                         expired_groups_retryable=retryable,
+                        retry_release_items=retry_release_items,
                     )
                     staleness = max((getattr(item, "seq_staleness", 0) for item in record.item), default=0)
                     if status == Status.EXPIRED:
@@ -617,6 +680,7 @@ class ReplayBuffer:
                 expired_counts[task_name] = expired_count
             await self._storage.delete(deleted_uids)
             await self._storage.update(updated_records)
+        await self._release_retryable_expired_sessions(retry_release_items)
         await self._discard_non_retryable_expired_groups(non_retryable_expired_groups)
         return expired_counts
 

@@ -89,10 +89,10 @@ def _build_fake_agent_loop():
         model_step = kwargs.get("model_step", kwargs.get("train_step", 0))
         for state in rollout_states:
             state.status = Status.COMPLETED
-            state.response_ids = [1, 2, 3]
+            state.append_response_tokens([1, 2, 3])
             state.response = "ok"
             state.reward = {"score": 1.0}
-            state.response_model_steps = [model_step] * len(state.response_ids)
+            state.response_model_steps = [model_step] * state.response_length
             state.input_ids = [10, 11, 1, 2, 3]
             state.labels = [-100, -100, 1, 2, 3]
             state.set_training_fields(input_ids=state.input_ids, labels=state.labels, logprobs=None)
@@ -265,8 +265,8 @@ class TestRLColocateTrainer(unittest.TestCase):
             produce_calls.append((batch_size, train_step, model_step))
             state = _FakeRolloutState(train_step)
             state.status = Status.COMPLETED
-            state.response_ids = [1, 2, 3]
-            state.response_model_steps = [model_step] * len(state.response_ids)
+            state.append_response_tokens([1, 2, 3])
+            state.response_model_steps = [model_step] * state.response_length
             state.input_ids = [10, 11, 1, 2, 3]
             state.labels = [-100, -100, 1, 2, 3]
             state.set_training_fields(input_ids=state.input_ids, labels=state.labels, logprobs=None)
@@ -291,7 +291,7 @@ class TestRLColocateTrainer(unittest.TestCase):
         rollout_state = RolloutState(
             message=[{"role": "user", "content": "hello"}],
             response="ok",
-            response_ids=[1, 2],
+            input_ids=[1, 2], prompt_length=0,
             reward={"score": 1.0},
             status=Status.COMPLETED,
         )
@@ -393,7 +393,7 @@ class TestRLColocateTrainer(unittest.TestCase):
                 mm_info={"pixel_values": ray.put(pixel_values)},
                 routed_experts=ray.put(routed_experts),
                 response="ok",
-                response_ids=[1],
+                input_ids=[1], prompt_length=0,
                 reward={"score": 1.0},
                 status=Status.COMPLETED,
             )

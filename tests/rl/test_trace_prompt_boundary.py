@@ -9,10 +9,10 @@ class TracePromptBoundaryTest(unittest.TestCase):
 
     def test_tools_and_versions_share_the_trace_boundary(self):
         s=self.store()
-        s.insert("s","prompt",TokenizedSegment(text="fixture",token_ids=[1,2,3],labels=[-100]*3,logprobs=[0.]*3,model_step=0))
-        s.insert("s","promptanswer",TokenizedSegment(text="fixture",token_ids=[4,5],labels=[4,5],logprobs=[-.1]*2,model_step=0,request_id="r0"))
-        s.insert("s","promptanswertool",TokenizedSegment(text="fixture",token_ids=[6],labels=[-100],logprobs=[0.],model_step=1))
-        s.insert("s","promptanswertoolanswer2",TokenizedSegment(text="fixture",token_ids=[7],labels=[7],logprobs=[-.2],model_step=1,request_id="r1"))
+        s.insert("s","prompt",TokenizedSegment(token_ids=[1,2,3],labels=[-100]*3,logprobs=[0.]*3,model_step=0))
+        s.insert("s","promptanswer",TokenizedSegment(token_ids=[4,5],labels=[4,5],logprobs=[-.1]*2,model_step=0,request_id="r0"))
+        s.insert("s","promptanswertool",TokenizedSegment(token_ids=[6],labels=[-100],logprobs=[0.],model_step=1))
+        s.insert("s","promptanswertoolanswer2",TokenizedSegment(token_ids=[7],labels=[7],logprobs=[-.2],model_step=1,request_id="r1"))
         data=s.export_training_trace("s","promptanswertoolanswer2")
         self.assertEqual(data["prompt_ids"],[1,2,3])
         self.assertEqual(data["response_ids"],[4,5,6,7])
@@ -22,7 +22,7 @@ class TracePromptBoundaryTest(unittest.TestCase):
 
     def test_reject_nonprompt_head(self):
         s=self.store()
-        s.insert("s","bad",TokenizedSegment(text="fixture",token_ids=[1,2],labels=[-100,2],logprobs=[0.,-.1]))
+        s.insert("s","bad",TokenizedSegment(token_ids=[1,2],labels=[-100,2],logprobs=[0.,-.1]))
         with self.assertRaisesRegex(ValueError,"not a prompt"):
             s.export_training_trace("s","bad")
 

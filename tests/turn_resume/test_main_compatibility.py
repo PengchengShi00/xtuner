@@ -32,7 +32,6 @@ def test_cross_update_trace_with_tool_tokens_matches_main_training_contract(monk
             "42",
             text,
             TokenizedSegment(
-                text=word,
                 token_ids=ids,
                 labels=labels,
                 logprobs=[-0.3 if label != -100 else 0 for label in labels],
@@ -86,7 +85,9 @@ def test_cross_update_trace_with_tool_tokens_matches_main_training_contract(monk
     state = states[0]
     assert state.status == Status.COMPLETED
     state.validate_training()
-    assert state.response_ids == [12, 13, 14, 15]
+    # 发布后 response_ids 不再单独存储，等于 input_ids 的 prompt 后连续后缀。
+    assert state.input_ids[state.train_meta.prompt_length :] == [12, 13, 14, 15]
+    assert state.response_length == 4
     assert state.response_model_steps == [0, 1, 1, 1]
     assert state.labels == [-100, -100, 12, -100, -100, 15]
     assert state.logprobs == [0, 0, -0.3, 0, 0, -0.3]
@@ -167,8 +168,8 @@ def test_ordinary_refs_are_freed_but_request_trace_borrowers_are_preserved(monke
 def test_trace_retirement_preserves_only_request_aware_shared_refs(monkeypatch, release_key):
     freed = []
     monkeypatch.setattr(trace_store, "_free_ray_refs", freed.append)
-    plain = TokenizedSegment(text="plain", token_ids=[1])
-    shared = TokenizedSegment(text="shared", token_ids=[2], request_id="r0", model_step=0)
+    plain = TokenizedSegment(token_ids=[1])
+    shared = TokenizedSegment(token_ids=[2], request_id="r0", model_step=0)
     for segment in [plain, shared]:
         trie = trace_store.Trie()
         trie.insert("prompt", segment)

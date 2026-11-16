@@ -81,12 +81,12 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
         *,
         uid: int = 1,
         prompt_ids: list[int] | None = None,
-        response_ids: list[int] | None = None,
         response: str | None = "response",
         logprobs: list[float] | None = None,
         status: Status = Status.COMPLETED,
         extra_fields: dict | None = None,
         input_ids: list[int] | None = None,
+        prompt_length: int | None = None,
         labels: list[int] | None = None,
         position_ids: np.ndarray | None = None,
     ) -> RolloutState:
@@ -96,20 +96,20 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=prompt_ids if prompt_ids is not None else [10, 11, 12],
             response=response,
-            response_ids=response_ids if response_ids is not None else [20, 21, 22],
             logprobs=logprobs,
             status=status,
             finish_reason="stop" if status == Status.COMPLETED else "error",
             extra_fields=extra_fields or {},
             input_ids=input_ids,
+            prompt_length=prompt_length,
             labels=labels,
             position_ids=position_ids,
         )
 
-    def test_builds_full_sequence_fields(self):
-        # prompt+response 样本构造统一约定：三者等长，labels 全监督，logprobs 前补 0。
+    def test_builds_labels_for_maintained_sequence(self):
+        # worker/loop 从第一轮起维护 input_ids；canonicalize 只补 labels 与 logprobs 前缀。
         loop = self._make_loop()
-        state = self._state(response_ids=[20, 21, 22], logprobs=[0.1, 0.2, 0.3])
+        state = self._state(input_ids=[10, 11, 12, 20, 21, 22], prompt_length=3, logprobs=[0.1, 0.2, 0.3])
 
         returned = loop.canonicalize_train_fields([state])
 
@@ -119,33 +119,29 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
         self.assertEqual(state.logprobs, [0.0, 0.0, 0.0, 0.1, 0.2, 0.3])
         self.assertEqual(state.status, Status.COMPLETED)
 
-    def test_tokenizer_fallback_when_response_ids_missing(self):
+    def test_tokenizer_fallback_when_input_ids_missing(self):
+        # 外部/纯文本 loop 只产出 response 文本时，canonicalize 仍负责 tokenize 并组装。
         loop = self._make_loop()
         state = self._state(response="ok")
-        state.response_ids = None
 
         loop.canonicalize_train_fields([state])
 
         loop.tokenizer.assert_called_once_with("ok", return_tensors="pt")
-        self.assertEqual(state.response_ids, [999, 998])
+        # 发布后 response_ids 不再单独存储，response 后缀由 train_meta 派生。
+        assert state.train_meta is not None
+        self.assertEqual(state.input_ids[state.train_meta.prompt_length :], [999, 998])
         self.assertEqual(state.input_ids, [10, 11, 12, 999, 998])
         self.assertEqual(state.labels, [-100, -100, -100, 999, 998])
 
-    def test_flattens_tensor_response_ids(self):
-        # rollout backend 可能返回 Tensor 形态的 response_ids，构造前需 flatten。
-        loop = self._make_loop()
-        state = self._state()
-        state.response_ids = torch.tensor([[20, 21, 22]])
-
-        loop.canonicalize_train_fields([state])
-
-        self.assertEqual(state.response_ids, [20, 21, 22])
-        self.assertEqual(state.input_ids, [10, 11, 12, 20, 21, 22])
-
     def test_vlm_uses_train_prompt_ids(self):
-        # VLM 分支用 extra_fields["train_prompt_ids"] 作为训练 prompt 构造全序列。
+        # VLM 的 input_ids 前缀是 expanded train_prompt_ids，prompt_length 随之取 2。
         loop = self._make_loop()
-        state = self._state(prompt_ids=[1], response_ids=[102, 103], extra_fields={"train_prompt_ids": [100, 101]})
+        state = self._state(
+            prompt_ids=[1],
+            extra_fields={"train_prompt_ids": [100, 101]},
+            input_ids=[100, 101, 102, 103],
+            prompt_length=2,
+        )
 
         loop.canonicalize_train_fields([state])
 
@@ -154,16 +150,21 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
 
     def test_logprobs_stay_none_when_missing(self):
         loop = self._make_loop()
-        state = self._state(logprobs=None)
+        state = self._state(input_ids=[10, 11, 12, 20, 21, 22], prompt_length=3, logprobs=None)
 
         loop.canonicalize_train_fields([state])
 
         self.assertIsNone(state.logprobs)
 
     def test_agentic_state_with_input_ids_is_untouched(self):
-        # 已有 input_ids 的全序列样本（agentic loop 产出）满足约定，零改动。
+        # 已有 input_ids/labels 的全序列样本（agentic loop 产出）满足约定，零改动。
         loop = self._make_loop()
-        state = self._state(input_ids=[30, 31, 40], labels=[-100, -100, 40], logprobs=[0.0, -0.1, -0.2])
+        state = self._state(
+            input_ids=[30, 31, 40],
+            prompt_length=2,
+            labels=[-100, -100, 40],
+            logprobs=[0.0, -0.1, -0.2],
+        )
         before = (list(state.input_ids), list(state.labels), list(state.logprobs))
 
         loop.canonicalize_train_fields([state])
@@ -173,13 +174,23 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
 
     def test_existing_full_sequence_fields_are_validated(self):
         loop = self._make_loop()
-        state = self._state(input_ids=[30, 31, 40], labels=[40], logprobs=None)
+        state = self._state(input_ids=[30, 31, 40], prompt_length=2, labels=[40], logprobs=None)
         loop.canonicalize_train_fields([state])
         self.assertEqual(state.status, Status.FAILED)
         self.assertIn("labels length mismatch", state.error_msg)
         with self.assertRaisesRegex(ValueError, "COMPLETED"):
             validate_train_group([state], task_name="test")
         loop.tokenizer.assert_not_called()
+
+    def test_prompt_only_sequence_is_rejected(self):
+        # reset 后 input_ids 只保留 prompt 前缀；没有 response 时不能发布全 -100 labels。
+        loop = self._make_loop()
+        state = self._state(input_ids=[10, 11, 12], prompt_length=3)
+
+        loop.canonicalize_train_fields([state])
+
+        self.assertEqual(state.status, Status.FAILED)
+        self.assertIn("response_ids must be non-empty", state.error_msg)
 
     def test_non_completed_state_is_skipped(self):
         loop = self._make_loop()
@@ -195,7 +206,7 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
         # canonicalize 通过后写下游调度消费的轻量统计：训练长度、prompt/response 长度、
         # 监督 token 数与 position 布局。
         loop = self._make_loop()
-        state = self._state(response_ids=[20, 21, 22], logprobs=[0.1, 0.2, 0.3])
+        state = self._state(input_ids=[10, 11, 12, 20, 21, 22], prompt_length=3, logprobs=[0.1, 0.2, 0.3])
 
         loop.canonicalize_train_fields([state])
 
@@ -211,8 +222,9 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
         loop = self._make_loop()
         state = self._state(
             prompt_ids=[1],
-            response_ids=[102, 103],
             extra_fields={"train_prompt_ids": [100, 101]},
+            input_ids=[100, 101, 102, 103],
+            prompt_length=2,
             position_ids=np.array([[[0, 1, 2]], [[0, 1, 2]], [[0, 1, 2]]], dtype=np.int64),
         )
 
@@ -224,12 +236,10 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
         self.assertEqual(state.train_meta.position_layout, "mrope_3d")
 
     def test_train_meta_prompt_length_falls_back_to_unsupervised_count(self):
-        # prompt_ids 缺失时 prompt 长度退回 shifted_labels 的非监督位计数（与旧 data_info 口径一致）。
+        # prompt_ids/prompt_length 都缺失时，prompt 长度退回 shifted_labels 的非监督位计数。
         loop = self._make_loop()
-        state = self._state()
+        state = self._state(input_ids=[30, 31, 40, 41], labels=[-100, -100, 40, 41])
         state.prompt_ids = None
-        state.input_ids = [30, 31, 40, 41]
-        state.labels = [-100, -100, 40, 41]
 
         loop.canonicalize_train_fields([state])
 
@@ -247,13 +257,11 @@ class TestAgentLoopCanonicalizeTrainFields(unittest.TestCase):
         self.assertIn("Prompt ids cannot be None or empty", state.error_msg)
 
     def test_empty_response_marks_sample_failed(self):
-        for response_ids in ([20, 21], []):
-            with self.subTest(response_ids=response_ids):
-                loop = self._make_loop()
-                state = self._state(response="", response_ids=response_ids)
-                loop.canonicalize_train_fields([state])
-                self.assertEqual(state.status, Status.FAILED)
-                self.assertIn("response must be non-empty", state.error_msg)
+        loop = self._make_loop()
+        state = self._state(response="")
+        loop.canonicalize_train_fields([state])
+        self.assertEqual(state.status, Status.FAILED)
+        self.assertIn("response must be non-empty", state.error_msg)
 
     def test_construction_error_marks_only_that_sample(self):
         loop = self._make_loop()
@@ -289,8 +297,8 @@ class TestAgenticLoopCanonicalizeTrainFields(unittest.TestCase):
             group_id=1,
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[10, 11],
+            prompt_length=2,
             response="ok",
-            response_ids=[20, 21],
             status=status,
             finish_reason="stop",
             input_ids=input_ids,
@@ -473,8 +481,8 @@ class TestPrepareRolloutItems(unittest.TestCase):
             group_id=group_id,
             message=[{"role": "user", "content": f"prompt {group_id}"}],
             prompt_ids=resolved_prompt_ids,
+            prompt_length=len(resolved_prompt_ids),
             response=response,
-            response_ids=resolved_response_ids,
             logprobs=logprobs,
             reward=reward if reward is not None else {"score": 1.0},
             status=status,
@@ -641,8 +649,8 @@ class TestPrepareRolloutItems(unittest.TestCase):
             group_id=2,
             message=[],
             prompt_ids=[10, 11],
+            prompt_length=2,
             response="response",
-            response_ids=[20, 21],
             response_model_steps=[1, 1],
             reward={"score": 1.0},
             status=Status.COMPLETED,
@@ -668,8 +676,9 @@ class TestPrepareRolloutItems(unittest.TestCase):
                 group_id=1,
                 message=[],
                 prompt_ids=[10, 11],
+                input_ids=[10, 11, 20, 21],
+                prompt_length=2,
                 response="ok",
-                response_ids=[20, 21],
                 response_model_steps=[0, 4],
                 logprobs=[-0.1, -0.2],
                 reward={"score": 1.0},

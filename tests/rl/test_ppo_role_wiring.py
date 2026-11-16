@@ -378,7 +378,7 @@ class TestCriticSegmentTargets(unittest.TestCase):
             group_id=0,
             message=[],
             prompt_ids=[1],
-            response_ids=[2, 3],
+            prompt_length=2,
             input_ids=[1, 2, 3, 4],
             labels=[-100, -100, 2, 3],
             reward={"score": reward} if reward is not None else None,

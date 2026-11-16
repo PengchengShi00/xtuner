@@ -136,6 +136,7 @@ class RolloutState(BaseModel):
     # Samples generated from the same prompt share one group_id.
     group_id: int | None = None
     message: list[dict[str, Any]]  # dataset输出，需要在AgentLoop中转换成input_ids
+    # 推理期工作字段：set_training_fields 发布后清除，之后等于 input_ids[:prompt_length]。
     prompt_ids: list[int] | None = None  # 原始 prompt的token ids
     num_tokens: int | None = None
     proxy_attn_flops: float | None = None
@@ -155,18 +156,22 @@ class RolloutState(BaseModel):
     # 每一次推理引擎的实际输出, 在rollout worker中被覆盖写
     response: str | None = None
     tool_calls: list[RolloutToolCall] | None = None
-    response_ids: list[int] | None = None
+    # response_ids 是 input_ids 去掉 prompt 前缀的连续后缀（含工具/环境 token），
+    # 由 response_ids property 从 input_ids + prompt_length 派生，不再单独存储。
     logprobs: list[float] | None = None
     teacher_targets: TeacherTargets | None = None
     routed_experts: np.ndarray | RayObjectRef | list[RayObjectRef] | None = None
     finish_reason: str | None = None
-    # response_model_steps：记录 response_ids 中每个 token 来自哪个 model_step，与 response_ids 长度相同。
+    # response_model_steps：记录 response 后缀中每个 token 来自哪个 model_step，与 response 后缀长度相同。
     # 环境/工具等非模型生成位沿用所在 rollout cycle 的 model_step 占位（勿填 0，避免污染 min() 语义）。
     response_model_steps: list[int] | None = None
     # 记录该样本过期程度，即最早生成 token 的模型版本与当前训练步数的差值，数值越大表示越过期。
     seq_staleness: int = 0
 
     input_ids: list[int] | None = None
+    # input_ids 中 prompt 前缀的长度；推理期由 append_response_tokens / trace 导出维护，
+    # 发布后与 train_meta.prompt_length 一致并保留，用于派生 response 后缀。
+    prompt_length: int | None = None
     labels: list[int] | None = None
     # 训练字段的唯一摘要；只有 set_training_fields / apply_response_mask / reset_response 维护它。
     train_meta: TrainMeta | None = None
@@ -210,15 +215,92 @@ class RolloutState(BaseModel):
         meta = self._build_train_meta(input_ids=ids, labels=target_labels, logprobs=full_logprobs)
         # 验证成功后才赋值：训练字段、训练长度和摘要一起发布。
         self.input_ids = ids
+        self.prompt_length = meta.prompt_length
         self.labels = target_labels
         self.logprobs = full_logprobs
         self.num_tokens = len(ids) - 1
         self.train_meta = meta
+        # prompt_ids/tokens 是推理期工作字段，发布后分别等于 input_ids[:prompt_length] 与
+        # 最后一次引擎输入；继续在 replay buffer 中保存会让序列的 token 列表近似翻倍，
+        # 这里清掉冗余副本。response_ids 由 property 从 input_ids 派生，无需存储。
+        self.prompt_ids = None
+        self.tokens = None
+
+    @property
+    def response_ids(self) -> list[int] | None:
+        """Contiguous response suffix of ``input_ids`` (env/tool tokens
+        included).
+
+        Derived view: ``input_ids[prompt_length:]``. During inference the sequence
+        and its boundary are maintained by :meth:`append_response_tokens`; after
+        publishing they come from ``train_meta``. Returns ``None`` when the
+        sequence or its prompt boundary is unknown.
+        """
+        prompt_length = self.effective_prompt_length()
+        if self.input_ids is None or prompt_length is None:
+            return None
+        return self.input_ids[prompt_length:]
+
+    @property
+    def response_length(self) -> int:
+        """Length of the contiguous response suffix.
+
+        Derived from ``input_ids`` and the effective prompt boundary, so it stays
+        consistent with the ``response_ids`` view. Returns 0 when the sequence or
+        its boundary is unknown.
+        """
+        prompt_length = self.effective_prompt_length()
+        if self.input_ids is None or prompt_length is None:
+            return 0
+        return max(0, len(self.input_ids) - prompt_length)
+
+    def append_response_tokens(self, token_ids: list[int]) -> None:
+        """Append one engine/agent output to the inference-phase sequence.
+
+        The first call initializes ``input_ids`` from the training prompt
+        (``extra_fields["train_prompt_ids"]`` for VLM, otherwise ``prompt_ids``)
+        and records ``prompt_length`` as the response boundary.
+
+        Args:
+            token_ids (list[int]): Newly generated tokens; env/tool tokens are
+                appended through the same entry point by the agent loop.
+
+        Returns:
+            None
+        """
+        if not token_ids:
+            return
+        if self.train_meta is not None or self.labels is not None:
+            raise ValueError("Cannot append response tokens after training fields are assembled")
+        self._ensure_prompt_prefix()
+        assert self.input_ids is not None
+        self.input_ids.extend(token_ids)
+
+    def replace_response_tokens(self, token_ids: list[int]) -> None:
+        """Replace the response suffix with ``token_ids``.
+
+        Used by the vLLM partial-rollout path, which preserves the historical
+        behavior of keeping only the latest output chunk (see the TODO there).
+
+        Args:
+            token_ids (list[int]): Tokens that replace the current response suffix.
+
+        Returns:
+            None
+        """
+        if not token_ids:
+            return
+        if self.train_meta is not None or self.labels is not None:
+            raise ValueError("Cannot replace response tokens after training fields are assembled")
+        self._ensure_prompt_prefix()
+        assert self.input_ids is not None and self.prompt_length is not None
+        del self.input_ids[self.prompt_length :]
+        self.input_ids.extend(token_ids)
 
     def apply_response_mask(self, effective_mask: list[bool]) -> None:
         """Bake one effective response mask into ``labels``.
 
-        The mask aligns with ``response_ids``; positions that are not kept become ignore
+        The mask aligns with the response suffix; positions that are not kept become ignore
         tokens. Length, prompt length and existing semantic holes are preserved.
 
         Args:
@@ -229,8 +311,8 @@ class RolloutState(BaseModel):
         """
         if self.labels is None or self.train_meta is None:
             raise ValueError("Training fields must be published before applying a response mask")
-        if len(effective_mask) != len(self.response_ids or []):
-            raise ValueError("Response mask must align with response_ids")
+        if len(effective_mask) != self.train_meta.response_length:
+            raise ValueError("Response mask must align with the response suffix")
         labels = list(self.labels)
         start = len(labels) - len(effective_mask)
         for index, keep in enumerate(effective_mask):
@@ -258,19 +340,33 @@ class RolloutState(BaseModel):
             if isinstance(routed_experts, (ObjectRef, list)):
                 free_object_refs(routed_experts)
         self.routed_experts = None
+        prompt_length = self.effective_prompt_length()
+        if prompt_length is not None:
+            # 保留权威 prompt 边界：重试时 append_response_tokens 直接续写。
+            self.prompt_length = prompt_length
         prompt_ids = self.prompt_ids
+        if prompt_ids is None and self.input_ids is not None and prompt_length is not None:
+            # 发布后 prompt_ids 已被清理；按 prompt_length 从 input_ids 切回 prompt。
+            prompt_ids = self.input_ids[:prompt_length]
+        if self.input_ids is None and prompt_ids is not None:
+            # 从未生成过的样本也统一保留 prompt 前缀，response 派生视图为空。
+            self.input_ids = list(prompt_ids)
+        if self.input_ids is not None and prompt_length is not None:
+            # 只保留 prompt 前缀，丢弃上一轮 response 后缀；labels 等派生字段一并失效。
+            self.input_ids = self.input_ids[:prompt_length]
+        else:
+            self.input_ids = None
+        self.prompt_ids = list(prompt_ids) if prompt_ids is not None else None
         self.tokens = list(prompt_ids) if prompt_ids is not None else None
         self.response = ""
-        self.response_ids = []
         self.logprobs = []
         self.teacher_targets = None
         self.finish_reason = None
         self.response_model_steps = []
         self.reward = None
         self.error_msg = None
-        # input_ids/labels 是上一轮 canonicalize 的产物，必须一并清掉，否则重生成后
-        # 基类 canonicalize 见 input_ids 非空会跳过重建，留下跨轮错位的训练字段。
-        self.input_ids = None
+        # labels/num_tokens 是上一轮 canonicalize 的产物，必须一并清掉，否则重生成后
+        # 基类 canonicalize 会把旧 labels 当作已组装字段。
         self.labels = None
         self.num_tokens = None
         self.train_meta = None
@@ -286,6 +382,8 @@ class RolloutState(BaseModel):
         """
         if self.input_ids is None or self.labels is None or self.train_meta is None:
             raise ValueError("Training input_ids, labels and train_meta must be present")
+        if self.prompt_length is not None and self.prompt_length != self.train_meta.prompt_length:
+            raise ValueError("prompt_length and train_meta.prompt_length are inconsistent")
         expected = self._build_train_meta(
             input_ids=self.input_ids,
             labels=self.labels,
@@ -294,10 +392,10 @@ class RolloutState(BaseModel):
         )
         if self.num_tokens != len(self.input_ids) - 1 or self.train_meta != expected:
             raise ValueError("Training fields and metadata are inconsistent")
-        if len(self.response_model_steps or []) != len(self.response_ids or []):
+        if len(self.response_model_steps or []) != self.train_meta.response_length:
             raise ValueError(
                 f"response_model_steps length={len(self.response_model_steps or [])}, "
-                f"expected response_ids={len(self.response_ids or [])}"
+                f"expected response suffix length={self.train_meta.response_length}"
             )
 
     def _build_train_meta(
@@ -314,17 +412,28 @@ class RolloutState(BaseModel):
             raise ValueError(f"labels length mismatch: {len(labels)} vs input_ids={len(input_ids)}")
         if logprobs is not None and len(logprobs) != len(input_ids):
             raise ValueError(f"logprobs length mismatch: {len(logprobs)} vs input_ids={len(input_ids)}")
-        response_length = len(self.response_ids or [])
-        if response_length > len(labels):
-            raise ValueError("Response suffix exceeds full labels")
         kept = sum(label != -100 for label in labels[1:])
         if prompt_length is None:
-            # prompt_len 统计原始输入 prompt 长度（VLM 的 prompt 在 train_prompt_ids）；
-            # prompt_ids 缺失时退回 shifted_labels 的非监督位计数。
-            prompt_ids = self.extra_fields.get("train_prompt_ids") or self.prompt_ids
-            prompt_length = len(prompt_ids) if prompt_ids else len(input_ids) - 1 - kept
+            if self.prompt_length is not None:
+                # 推理期维护的权威边界；发布后与 train_meta.prompt_length 一致。
+                prompt_length = self.prompt_length
+            elif self.train_meta is not None:
+                # 兼容未携带 prompt_length 的旧状态（如旧 checkpoint / 反序列化）。
+                prompt_length = self.train_meta.prompt_length
+            else:
+                # prompt_len 统计原始输入 prompt 长度（VLM 的 prompt 在 train_prompt_ids）。
+                prompt_ids = self.extra_fields.get("train_prompt_ids") or self.prompt_ids
+                if prompt_ids:
+                    prompt_length = len(prompt_ids)
+                else:
+                    prompt_length = len(input_ids) - 1 - kept
         if prompt_length < 0:
             raise ValueError("prompt_length must be nonnegative")
+        if prompt_length > len(input_ids):
+            raise ValueError("prompt_length exceeds input_ids")
+        # response 是 input_ids 去掉 prompt 前缀的连续后缀；长度统一由
+        # input_ids 与 prompt_length 推导，不再依赖 response_ids 副本。
+        response_length = len(input_ids) - prompt_length
         position_ids = self.position_ids
         return TrainMeta(
             prompt_length=prompt_length,
@@ -335,6 +444,35 @@ class RolloutState(BaseModel):
             has_routed_experts=self.routed_experts is not None,
             segment_index=self.extra_fields.get("agent_trace_segment_index"),
         )
+
+    def effective_prompt_length(self) -> int | None:
+        """Return the prompt boundary used to derive the response suffix.
+
+        Prefers the explicit ``prompt_length`` field, then ``train_meta``, then
+        the training prompt ids.
+
+        Returns:
+            int | None: Prompt token count, or ``None`` when unknown.
+        """
+        if self.prompt_length is not None:
+            return self.prompt_length
+        if self.train_meta is not None:
+            return self.train_meta.prompt_length
+        prompt_ids = self.extra_fields.get("train_prompt_ids") or self.prompt_ids
+        return len(prompt_ids) if prompt_ids else None
+
+    def _ensure_prompt_prefix(self) -> None:
+        if self.input_ids is not None:
+            if self.prompt_length is None:
+                self.prompt_length = self.effective_prompt_length()
+                if self.prompt_length is None:
+                    raise ValueError("prompt_length is unknown for an existing input_ids sequence")
+            return
+        prompt_ids = self.extra_fields.get("train_prompt_ids") or self.prompt_ids or self.tokens
+        if not prompt_ids:
+            raise ValueError("Cannot build input_ids without prompt ids")
+        self.input_ids = list(prompt_ids)
+        self.prompt_length = len(prompt_ids)
 
 
 def free_rollout_state_refs(rollout_state: RolloutState) -> None:
@@ -494,7 +632,7 @@ def get_group_status(rollout_states: list[RolloutState]) -> Status:
 def update_sample_version(rollout_state: RolloutState, model_step: int) -> RolloutState:
     """Append token source model version for newly generated response
     tokens."""
-    response_len = len(rollout_state.response_ids or [])
+    response_len = rollout_state.response_length
     response_model_steps = list(rollout_state.response_model_steps or [])
     missing_response_steps = max(0, response_len - len(response_model_steps))
     if missing_response_steps:
@@ -524,12 +662,12 @@ def _calculate_effective_response_mask(
     """Calculate the effective response mask of one rollout state without
     mutating it.
 
-    Every loop writes ``response_ids`` under one convention: the contiguous suffix of ``input_ids`` after
-    the prompt (env-injected or tool tokens included), so response token ``j`` maps to labels position
-    ``len(labels) - len(response_ids) + j``. The effective mask follows the reasoning-RL rule
-    ``effective = semantic_mask * token_staleness_mask``: the semantic mask is recovered from
-    ``labels != -100`` on the response region (semantic holes stay supervised-out regardless of staleness),
-    and staleness is evaluated per token via ``response_model_steps``.
+    Every loop writes the response as the contiguous suffix of ``input_ids`` after the prompt
+    (env-injected or tool tokens included; exposed as ``response_ids`` before publishing), so response
+    token ``j`` maps to labels position ``len(labels) - response_length + j``. The effective mask follows
+    the reasoning-RL rule ``effective = semantic_mask * token_staleness_mask``: the semantic mask is
+    recovered from ``labels != -100`` on the response region (semantic holes stay supervised-out
+    regardless of staleness), and staleness is evaluated per token via ``response_model_steps``.
 
     Args:
         rollout_state (RolloutState): Rollout sample to inspect; left unmodified.
@@ -537,14 +675,13 @@ def _calculate_effective_response_mask(
         token_stale_threshold (int): Maximum token staleness, measured in trainer steps, allowed for training.
 
     Returns:
-        list[int]: The effective mask aligned with ``response_ids``.
+        list[int]: The effective mask aligned with the response suffix.
     """
     labels = cast(list[int], rollout_state.labels)
-    response_ids = cast(list[int], rollout_state.response_ids)
     response_model_steps = cast(list[int], rollout_state.response_model_steps)
 
-    # response_ids 是 input_ids 去掉 prompt 前缀的连续后缀，offset 即 prompt 长度。
-    offset = len(labels) - len(response_ids)
+    # 响应区间是 input_ids 去掉 prompt 前缀的连续后缀，offset 即 prompt 长度。
+    offset = len(labels) - rollout_state.response_length
     # semantic_mask: labels 中非 -100 的监督位；token_staleness_mask: 逐 token 新鲜度
     # （语义洞位的 staleness 值无意义，乘上 semantic_mask 后自然归零）。
     semantic_mask = [label != -100 for label in labels[offset:]]
@@ -587,7 +724,14 @@ def calculate_group_effective_response_masks(
 
     masks: list[list[bool] | None] = []
     for item in group:
-        if item.labels is None or not item.response_ids or len(item.labels) < len(item.response_ids):
+        response_length = item.response_length
+        version_length = len(item.response_model_steps or [])
+        if (
+            item.labels is None
+            or response_length == 0
+            or version_length != response_length
+            or len(item.labels) < response_length
+        ):
             masks.append(None)
             continue
         masks.append(
@@ -611,11 +755,11 @@ def validate_rollout_group(group: list[RolloutState], *, task_name: str) -> None
         context = f"task={task_name!r}, group_id={state.group_id}, rollout_id={state.rollout_id}"
         if state.status not in allowed:
             raise ValueError(f"{context}: invalid generated status {state.status}")
-        response_length = len(state.response_ids or [])
+        response_length = state.response_length
         version_length = len(state.response_model_steps or [])
         if version_length > response_length:
             raise ValueError(
-                f"{context}: response_model_steps length={version_length}, expected at most response_ids={response_length}"
+                f"{context}: response_model_steps length={version_length}, expected at most response suffix={response_length}"
             )
 
 

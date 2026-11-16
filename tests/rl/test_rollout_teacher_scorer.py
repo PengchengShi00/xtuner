@@ -15,7 +15,8 @@ class TestRolloutTeacherScorer(unittest.IsolatedAsyncioTestCase):
             prompt_ids=[uid],
             tokens=None,
             response=None,
-            response_ids=[uid],
+            input_ids=[uid, uid],
+            prompt_length=1,
             status=status,
             extra_fields={"origin_data_source": "math"},
         )
